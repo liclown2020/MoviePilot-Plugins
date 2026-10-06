@@ -50,7 +50,7 @@ class DoubanArchive(_PluginBase):
     plugin_name = "豆瓣书影音档案"
     plugin_desc = "将剧集在看、看完状态同步到豆瓣书影音档案，不依赖 TMDB 识别。"
     plugin_icon = "Douban_A.png"
-    plugin_version = "1.0.0"
+    plugin_version = "1.0.1"
     plugin_author = "liclown2020"
     author_url = "https://github.com/liclown2020"
     plugin_config_prefix = "doubanarchive_"
@@ -163,11 +163,18 @@ class DoubanArchive(_PluginBase):
         info = getattr(event, "event_data", None)
         if not isinstance(info, WebhookEventInfo) or not self._enabled:
             return
+
+        logger.info(
+            f"收到事件：{info.event or '-'} | 标题：{info.item_name or '-'} | "
+            f"类型：{info.item_type or '-'} | 用户：{info.user_name or '-'} | 服务器：{info.server_name or '-'}")
         if not self._is_target_user(info.user_name):
+            logger.debug(f"用户 {info.user_name} 不在配置的媒体库用户名内，忽略")
             return
         if not self._is_sync_event(info):
+            logger.debug(f"事件 {info.event} 不是播放或标记已观看事件，忽略")
             return
         if not self._is_allowed_path(info.item_path):
+            logger.debug(f"路径 {info.item_path} 命中排除关键词，忽略")
             return
 
         title, media_type, season, episode = self._parse_media(info)
