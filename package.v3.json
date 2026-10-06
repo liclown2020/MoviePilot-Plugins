@@ -1,0 +1,15 @@
+{
+  "DoubanArchive": {
+    "name": "豆瓣书影音档案",
+    "description": "将剧集在看、看完状态同步到豆瓣书影音档案，不依赖 TMDB 识别，失败自动重试。",
+    "labels": "豆瓣",
+    "version": "1.0.0",
+    "icon": "douban.png",
+    "author": "liclown2020",
+    "level": 1,
+    "system_version": ">=3.0.0",
+    "history": {
+      "v1.0.0": "首个版本：事件延后处理、优先使用媒体库刮削的豆瓣ID、frodo搜索、失败队列重试。"
+    }
+  }
+}
