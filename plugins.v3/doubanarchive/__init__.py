@@ -1,4 +1,4 @@
-"""豆瓣书影音档案：把媒体服务器的播放进度同步到豆瓣「书影音档案」。
+"""豆瓣档案同步：把媒体服务器的播放进度同步到豆瓣「书影音档案」。
 
 设计要点：
 1. 不依赖 TMDB 识别，TMDB 不可用时仍能完成同步；
@@ -41,16 +41,18 @@ _PLAYED = {"item.markplayed", "media.scrobble"}
 _KEY_ARCHIVE = "archive"
 # 待重试队列键
 _KEY_PENDING = "pending"
+# 仪表盘 key，宿主用它区分同一插件的多个仪表盘
+_KEY_DASHBOARD = "archive"
 
 
 class DoubanArchive(_PluginBase):
     """把剧集/电影的观看进度写入豆瓣书影音档案。"""
 
     # 插件基本信息
-    plugin_name = "豆瓣书影音档案"
-    plugin_desc = "将剧集在看、看完状态同步到豆瓣书影音档案，不依赖 TMDB 识别。"
+    plugin_name = "豆瓣档案同步"
+    plugin_desc = "将在看、看完状态同步到豆瓣书影音档案，不依赖 TMDB 识别，失败自动重试。"
     plugin_icon = "Douban_A.png"
-    plugin_version = "1.0.1"
+    plugin_version = "1.1.0"
     plugin_author = "liclown2020"
     author_url = "https://github.com/liclown2020"
     plugin_config_prefix = "doubanarchive_"
@@ -103,9 +105,9 @@ class DoubanArchive(_PluginBase):
             self.update_config(config)
 
         if self._enabled:
-            logger.info("豆瓣书影音档案插件已启用")
+            logger.info("豆瓣档案同步插件已启用")
         else:
-            logger.info("豆瓣书影音档案插件未启用")
+            logger.info("豆瓣档案同步插件未启用")
 
     def get_state(self) -> bool:
         """返回插件启用状态。"""
@@ -131,7 +133,7 @@ class DoubanArchive(_PluginBase):
         return [
             {
                 "id": "DoubanArchive.Retry",
-                "name": "豆瓣档案失败队列重试",
+                "name": "豆瓣档案同步失败重试",
                 "trigger": CronTrigger.from_crontab("*/30 * * * *"),
                 "func": self.retry_pending,
                 "kwargs": {},
@@ -242,8 +244,10 @@ class DoubanArchive(_PluginBase):
         display = self._display_title(subject_name or title, season)
         if client.set_status(subject_id=subject_id, status=status, private=self._private):
             logger.info(f"{display} 同步到档案成功（{self._status_text(status)}）")
+            # 海报优先用豆瓣官方竖版，取不到再退回媒体服务器的图
+            image = client.get_subject_image(subject_id, media_type) or payload.get("image") or ""
             self._save_archive(key, payload, subject_name or title, subject_id,
-                               season, media_type, status, display)
+                               season, media_type, status, display, image=image)
             self._drop_pending(key)
             return
 
@@ -251,9 +255,16 @@ class DoubanArchive(_PluginBase):
         self._save_pending(key, payload, subject_name or title, season, media_type, status, subject_id)
 
     def retry_pending(self) -> None:
-        """重试待处理队列中的条目，成功后移出队列。"""
+        """重试待处理队列中的条目，成功后移出队列，并顺带补齐缺失的海报。"""
         if not self._enabled:
             return
+
+        # 仪表盘海报墙依赖封面图，历史缺图条目在这里慢慢补齐
+        try:
+            self._fill_missing_images()
+        except Exception as error:
+            logger.debug(f"补齐豆瓣海报失败：{error}")
+
         pending = dict(self.get_data(_KEY_PENDING) or {})
         if not pending:
             logger.info("豆瓣同步失败队列为空")
@@ -292,7 +303,8 @@ class DoubanArchive(_PluginBase):
     # ---------------- 数据读写 ----------------
 
     def _save_archive(self, key: str, payload: Dict[str, Any], subject_name: str, subject_id: str,
-                      season: int, media_type: str, status: str, display: str) -> None:
+                      season: int, media_type: str, status: str, display: str,
+                      image: str = "") -> None:
         """写入已同步档案。"""
         with self._lock:
             archive = dict(self.get_data(_KEY_ARCHIVE) or {})
@@ -304,10 +316,38 @@ class DoubanArchive(_PluginBase):
                 "episode": self._to_int(payload.get("episode"), 0, 0),
                 "type": "电视剧" if media_type == "TV" else "电影",
                 "status": status,
-                "image": payload.get("image") or "",
+                "image": image or payload.get("image") or "",
                 "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             }
             self.save_data(_KEY_ARCHIVE, archive)
+
+    def _fill_missing_images(self, limit: int = 5) -> None:
+        """补齐档案里缺失的海报，单次最多处理 limit 条，失败不影响其它逻辑。"""
+        with self._lock:
+            snapshot = dict(self.get_data(_KEY_ARCHIVE) or {})
+            todo = [key for key, item in snapshot.items()
+                    if isinstance(item, dict) and item.get("subject_id") and not item.get("image")][:limit]
+            if not todo:
+                return
+
+        client = DoubanClient(cookie=self._load_cookie())
+        filled: Dict[str, str] = {}
+        for key in todo:
+            item = snapshot.get(key) or {}
+            media_type = "MOV" if str(item.get("type") or "").startswith("电影") else "TV"
+            image = client.get_subject_image(str(item.get("subject_id") or ""), media_type)
+            if image:
+                filled[key] = image
+
+        if not filled:
+            return
+        with self._lock:
+            archive = dict(self.get_data(_KEY_ARCHIVE) or {})
+            for key, image in filled.items():
+                if key in archive and not archive[key].get("image"):
+                    archive[key]["image"] = image
+            self.save_data(_KEY_ARCHIVE, archive)
+        logger.info(f"豆瓣档案补齐海报 {len(filled)} 条")
 
     def _save_pending(self, key: str, payload: Dict[str, Any], subject_name: str, season: int,
                       media_type: str, status: str, subject_id: str = "") -> None:
@@ -755,118 +795,148 @@ class DoubanArchive(_PluginBase):
             {"component": "VList", "content": rows},
         ]
 
+    @staticmethod
+    def get_dashboard_meta() -> Optional[List[Dict[str, str]]]:
+        """声明仪表盘 key 与名称，不声明时宿主只能给出空 key，组件标题会显示异常。"""
+        return [{"key": _KEY_DASHBOARD, "name": "豆瓣档案"}]
+
     def get_dashboard(self, key: str, **kwargs: Any) -> Optional[Tuple[Dict[str, Any], Dict[str, Any], List[Dict[str, Any]]]]:
         """返回仪表盘：按月分组的豆瓣档案海报墙。"""
+        if key and key != _KEY_DASHBOARD:
+            return None
         mobile = self._is_mobile(kwargs.get("user_agent"))
         archive = self.get_data(_KEY_ARCHIVE) or {}
-        limit_month = (self._mobile_month if mobile else self._pc_month) - 1
-        limit_num = self._mobile_num if mobile else self._pc_num
+        limit_month = max(1, self._mobile_month if mobile else self._pc_month)
+        limit_num = max(1, self._mobile_num if mobile else self._pc_num)
+
+        # 显式给出标题，避免宿主用插件名兜底导致标题不一致
+        attrs: Dict[str, Any] = {
+            "refresh": 600,
+            "border": True,
+            "title": "豆瓣档案同步",
+            "subtitle": f"共 {len(archive)} 部",
+        }
+        empty = [
+            {"component": "VAlert",
+             "props": {"type": "info", "variant": "tonal",
+                       "text": "还没有同步记录，在 Emby / Jellyfin 里看一集后会自动出现在这里。"}}
+        ]
 
         sorted_items = sorted(
             [item for item in archive.values() if isinstance(item, dict) and item.get("timestamp")],
             key=lambda item: item["timestamp"],
             reverse=True,
         )
+        if not sorted_items:
+            return {"cols": 12, "md": 6}, attrs, empty
 
-        content: List[Dict[str, Any]] = []
-        last_month = None
-        current_item: Optional[Dict[str, Any]] = None
-
+        # 按 (年, 月) 分组，跨年时月份不会串在一起
+        groups: Dict[Tuple[int, int], List[Dict[str, Any]]] = {}
         for record in sorted_items:
-            try:
-                time_object = datetime.strptime(record["timestamp"], "%Y-%m-%d %H:%M:%S")
-            except Exception:
+            time_object = self._parse_time(record.get("timestamp"))
+            if time_object is None:
                 continue
+            groups.setdefault((time_object.year, time_object.month), []).append(record)
 
-            if time_object.month != last_month:
-                if limit_month < 0:
-                    break
-                if current_item:
-                    self._finish_month_item(current_item, limit_num)
-                    content.append(current_item)
-                limit_month -= 1
-                current_item = self._new_month_item(time_object)
-                last_month = time_object.month
-
-            if current_item is None:
+        timeline_items: List[Dict[str, Any]] = []
+        for year, month in sorted(groups.keys(), reverse=True)[:limit_month]:
+            cards = [card for card in (self._build_card(item, mobile) for item in groups[(year, month)]) if card]
+            if not cards:
                 continue
-            card = self._build_card(record, mobile)
-            if card:
-                current_item["content"][0]["content"][1]["content"].append(card)
+            timeline_items.append({
+                "component": "VTimelineItem",
+                "props": {"size": "x-small", "dot-color": "primary"},
+                "content": [
+                    {
+                        "component": "h1",
+                        "props": {"class": "text-base",
+                                  "style": "padding:0rem 0rem 0.5rem 0rem;font-weight:bold;"},
+                        "html": f"{year}年{month}月 <span class='text-sm font-normal'>共 {len(cards)} 部</span>",
+                    },
+                    {
+                        "component": "VRow",
+                        "props": {"class": "pa-0 ma-0", "style": "padding:0rem;"},
+                        "content": cards[:limit_num],
+                    },
+                ],
+            })
 
-        if current_item:
-            self._finish_month_item(current_item, limit_num)
-            content.append(current_item)
+        if not timeline_items:
+            return {"cols": 12, "md": 6}, attrs, empty
 
         return (
-            {"cols": 12, "md": 12},
-            {"refresh": 600, "border": False},
-            [{"component": "VRow", "props": {}, "content": content}] if content else [],
+            {"cols": 12, "md": 8},
+            attrs,
+            [
+                {
+                    # VTimelineItem 必须放在 VTimeline 里，否则时间线渲染不出来
+                    "component": "VTimeline",
+                    "props": {"density": "compact"},
+                    "content": timeline_items,
+                }
+            ],
         )
 
     # ---------------- 仪表盘辅助 ----------------
 
     @staticmethod
-    def _new_month_item(time_object: datetime) -> Dict[str, Any]:
-        """创建某个月份的时间线分组节点。"""
-        return {
-            "component": "VTimelineItem",
-            "props": {"size": "x-small"},
-            "content": [
-                {
-                    "component": "VCol",
-                    "props": {"style": "padding: 0rem 0rem 0rem 0rem"},
-                    "content": [
-                        {
-                            "component": "h1",
-                            "props": {"style": "padding:0rem 0rem 1rem 0rem;font-weight: bold;",
-                                      "class": "text-base"},
-                            "html": f"{time_object.month}月 ",
-                        },
-                        {"component": "VRow", "props": {"style": "padding: 0rem"}, "content": []},
-                    ],
-                }
-            ],
-        }
-
-    @staticmethod
-    def _finish_month_item(month_item: Dict[str, Any], limit_num: int) -> None:
-        """补齐月份标题里的数量说明并截断超出的卡片。"""
-        cards = month_item["content"][0]["content"][1]["content"]
-        month_item["content"][0]["content"][0]["html"] += f"<span class='text-sm font-normal'>同步{len(cards)}部</span>"
-        month_item["content"][0]["content"][1]["content"] = cards[:limit_num]
+    def _parse_time(value: Any) -> Optional[datetime]:
+        """解析档案里的时间戳，格式不对返回 None。"""
+        if not value:
+            return None
+        try:
+            return datetime.strptime(str(value), "%Y-%m-%d %H:%M:%S")
+        except Exception:
+            return None
 
     @staticmethod
     def _build_card(record: Dict[str, Any], mobile: bool) -> Optional[Dict[str, Any]]:
-        """把一条档案记录渲染成海报卡片，缺图时跳过。"""
-        image = record.get("image")
-        subject_id = record.get("subject_id")
+        """把一条档案记录渲染成海报卡片；没有豆瓣条目就无处跳转，直接跳过。"""
+        subject_id = str(record.get("subject_id") or "")
         if not subject_id:
             return None
-        if not image:
-            return None
+
+        title = str(record.get("title") or record.get("subject_name") or "")
+        status = DoubanArchive._status_text(str(record.get("status") or ""))
+        width, height = ("44px", "66px") if mobile else ("66px", "99px")
+        image = str(record.get("image") or "")
+
+        if image:
+            body = [
+                {
+                    "component": "VImg",
+                    "props": {
+                        "src": image,
+                        "cover": True,
+                        "aspect-ratio": "2/3",
+                        "style": f"width:{width}; height:{height};",
+                    },
+                }
+            ]
+        else:
+            # 缺封面时用文字占位，保证这条记录不会从海报墙上凭空消失
+            body = [
+                {
+                    "component": "VCardText",
+                    "props": {
+                        "class": "text-caption text-center pa-1",
+                        "style": f"width:{width}; height:{height};display:flex;"
+                                 f"align-items:center;justify-content:center;",
+                        "text": title[:4] or "豆瓣",
+                    },
+                }
+            ]
+
         return {
             "component": "a",
             "props": {
                 "href": f"https://movie.douban.com/subject/{subject_id}/",
                 "target": "_blank",
-                "style": "padding: 0.2rem",
+                "title": f"{title} · {status}",
+                "style": "padding: 0.2rem; text-decoration: none;",
             },
             "content": [
-                {
-                    "component": "VCard",
-                    "props": {"class": "elevation-4"},
-                    "content": [
-                        {
-                            "component": "VImg",
-                            "props": {
-                                "src": image,
-                                "style": "width:44px; height: 66px;" if mobile else "width:66px; height: 99px;",
-                                "aspect-ratio": "2/3",
-                            },
-                        }
-                    ],
-                }
+                {"component": "VCard", "props": {"class": "elevation-2"}, "content": body}
             ],
         }
 
