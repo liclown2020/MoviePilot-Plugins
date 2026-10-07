@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import json
 from http.cookies import SimpleCookie
 from typing import Any, Dict, Optional, Tuple
@@ -113,7 +114,46 @@ class DoubanClient:
                 return value
         return None
 
+    def fetch_image_data_uri(self, url: str, prefer_small: bool = True) -> Optional[str]:
+        """
+        把豆瓣图片转成 data URI。
+        豆瓣图片有防盗链：浏览器带着本站 Referer 去取会返回 403，
+        因此由后端带上豆瓣自己的 Referer 取回后内联，前端不再直接访问豆瓣。
+        """
+        if not url or "doubanio.com" not in url:
+            return None
+        candidates = []
+        if prefer_small:
+            # 海报墙只需要小图，取小图能显著降低仪表盘数据体积
+            small = url.replace("/l_ratio_poster/", "/s_ratio_poster/") \
+                       .replace("/m_ratio_poster/", "/s_ratio_poster/")
+            if small != url:
+                candidates.append(small)
+        candidates.append(url)
+        for target in candidates:
+            result = self._download_image(target)
+            if result:
+                return result
+        return None
+
     # ---------------- 内部实现 ----------------
+
+    def _download_image(self, url: str) -> Optional[str]:
+        """下载单张图片并转成 data URI，失败返回 None。"""
+        headers = self._build_base_headers()
+        headers["Referer"] = "https://movie.douban.com/"
+        try:
+            response = RequestUtils(headers=headers, timeout=self._timeout).get_res(url)
+        except Exception as error:
+            logger.debug(f"下载豆瓣图片异常：{error}")
+            return None
+        if response is None or response.status_code != 200:
+            return None
+        content = getattr(response, "content", None)
+        if not content or len(content) > 2 * 1024 * 1024:
+            return None
+        content_type = (response.headers.get("Content-Type") or "image/jpeg").split(";")[0].strip()
+        return f"data:{content_type};base64," + base64.b64encode(content).decode("ascii")
 
     def _post_interest(self, subject_id: str, payload: Dict[str, Any], retry: bool = False) -> bool:
         """提交状态写入请求，403 时刷新 ck 后重试一次。"""
