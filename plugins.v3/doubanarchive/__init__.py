@@ -43,6 +43,12 @@ _KEY_ARCHIVE = "archive"
 _KEY_PENDING = "pending"
 # 仪表盘 key，宿主用它区分同一插件的多个仪表盘
 _KEY_DASHBOARD = "archive"
+# 豆瓣图片 data URI 缓存键（避免每次刷新都回源）
+_KEY_IMAGES = "images"
+# 单次渲染最多回源几张图，避免仪表盘请求太久
+_INLINE_BUDGET = 8
+# 图片缓存最多保留多少张
+_IMAGE_CACHE_MAX = 200
 
 
 class DoubanArchive(_PluginBase):
@@ -52,7 +58,7 @@ class DoubanArchive(_PluginBase):
     plugin_name = "豆瓣档案同步"
     plugin_desc = "将在看、看完状态同步到豆瓣书影音档案，不依赖 TMDB 识别，失败自动重试。"
     plugin_icon = "Douban_A.png"
-    plugin_version = "1.1.0"
+    plugin_version = "1.2.0"
     plugin_author = "liclown2020"
     author_url = "https://github.com/liclown2020"
     plugin_config_prefix = "doubanarchive_"
@@ -74,9 +80,19 @@ class DoubanArchive(_PluginBase):
     _pc_num = 50
     _mobile_month = 2
     _mobile_num = 15
+    # 豆瓣图片有防盗链，仪表盘用后端取回的 data URI，这里做内存缓存
+    _inline_image = True
+    _inline_limit = 20
 
     # 保护存档读写，避免并发任务互相覆盖
     _lock = threading.Lock()
+    # 图片地址 -> data URI，进程内共享，重启后按需重新拉取
+    _image_cache: Dict[str, str] = {}
+    # 渲染期临时状态：图片映射、是否有新增、本次还能拉几张
+    _image_map: Dict[str, str] = {}
+    _image_dirty = False
+    _image_budget = 0
+    _image_failed: set = set()
 
     # ---------------- 生命周期 ----------------
 
@@ -97,6 +113,8 @@ class DoubanArchive(_PluginBase):
         self._pc_num = self._to_int(config.get("pc_num"), 50, 1)
         self._mobile_month = self._to_int(config.get("mobile_month"), 2, 2)
         self._mobile_num = self._to_int(config.get("mobile_num"), 15, 1)
+        self._inline_image = bool(config.get("inline_image", True))
+        self._inline_limit = self._to_int(config.get("inline_limit"), 20, 1)
 
         if config.get("onlyonce"):
             # 勾选立即运行一次：延后执行待处理队列重试
@@ -525,6 +543,8 @@ class DoubanArchive(_PluginBase):
         """
         raw = (info.item_name or "").strip()
         title = re.split(r"\s*[-–]\s*S\d|\s+S\d", raw)[0].strip() or raw
+        # 去掉结尾的年份，例如「功夫女足 (2026)」
+        title = re.sub(r"\s*[（(]\s*(19|20)\d{2}\s*[）)]\s*$", "", title).strip() or raw
         season = self._to_int(info.season_id, 0, 0)
         episode = self._to_int(info.episode_id, 0, 0)
 
@@ -711,6 +731,28 @@ class DoubanArchive(_PluginBase):
                         "content": [
                             {
                                 "component": "VCol",
+                                "props": {"cols": 12, "md": 6},
+                                "content": [
+                                    {"component": "VSwitch",
+                                     "props": {"model": "inline_image", "label": "内联豆瓣图片（防盗链）"}}
+                                ],
+                            },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 6},
+                                "content": [
+                                    {"component": "VTextField",
+                                     "props": {"model": "inline_limit", "label": "最多内联图片数",
+                                               "placeholder": "20"}}
+                                ],
+                            },
+                        ],
+                    },
+                    {
+                        "component": "VRow",
+                        "content": [
+                            {
+                                "component": "VCol",
                                 "props": {"cols": 12},
                                 "content": [
                                     {
@@ -719,7 +761,8 @@ class DoubanArchive(_PluginBase):
                                             "type": "info",
                                             "variant": "tonal",
                                             "text": "本插件不依赖 TMDB 识别；豆瓣 ID 优先使用媒体服务器已刮削的标识。"
-                                                   "同步失败会进入队列，每 30 分钟自动重试。",
+                                                   "同步失败会进入队列，每 30 分钟自动重试。"
+                                                   "豆瓣图片有防盗链，关闭「内联豆瓣图片」后仪表盘可能显示不出封面。",
                                         },
                                     }
                                 ],
@@ -744,6 +787,8 @@ class DoubanArchive(_PluginBase):
             "pc_num": 50,
             "mobile_month": 2,
             "mobile_num": 15,
+            "inline_image": True,
+            "inline_limit": 20,
         }
 
     def get_page(self) -> List[Dict[str, Any]]:
@@ -838,44 +883,48 @@ class DoubanArchive(_PluginBase):
                 continue
             groups.setdefault((time_object.year, time_object.month), []).append(record)
 
-        timeline_items: List[Dict[str, Any]] = []
-        for year, month in sorted(groups.keys(), reverse=True)[:limit_month]:
-            cards = [card for card in (self._build_card(item, mobile) for item in groups[(year, month)]) if card]
-            if not cards:
-                continue
-            timeline_items.append({
-                "component": "VTimelineItem",
-                "props": {"size": "x-small", "dot-color": "primary"},
-                "content": [
+        self._prepare_images()
+        try:
+            timeline_items: List[Dict[str, Any]] = []
+            for year, month in sorted(groups.keys(), reverse=True)[:limit_month]:
+                cards = [card for card in (self._build_card(item, mobile) for item in groups[(year, month)]) if card]
+                if not cards:
+                    continue
+                timeline_items.append({
+                    "component": "VTimelineItem",
+                    "props": {"size": "x-small", "dot-color": "primary"},
+                    "content": [
+                        {
+                            "component": "h1",
+                            "props": {"class": "text-base",
+                                      "style": "padding:0rem 0rem 0.5rem 0rem;font-weight:bold;"},
+                            "html": f"{year}年{month}月 <span class='text-sm font-normal'>共 {len(cards)} 部</span>",
+                        },
+                        {
+                            "component": "VRow",
+                            "props": {"class": "pa-0 ma-0", "style": "padding:0rem;"},
+                            "content": cards[:limit_num],
+                        },
+                    ],
+                })
+
+            if not timeline_items:
+                return {"cols": 12, "md": 6}, attrs, empty
+
+            return (
+                {"cols": 12, "md": 8},
+                attrs,
+                [
                     {
-                        "component": "h1",
-                        "props": {"class": "text-base",
-                                  "style": "padding:0rem 0rem 0.5rem 0rem;font-weight:bold;"},
-                        "html": f"{year}年{month}月 <span class='text-sm font-normal'>共 {len(cards)} 部</span>",
-                    },
-                    {
-                        "component": "VRow",
-                        "props": {"class": "pa-0 ma-0", "style": "padding:0rem;"},
-                        "content": cards[:limit_num],
-                    },
+                        # VTimelineItem 必须放在 VTimeline 里，否则时间线渲染不出来
+                        "component": "VTimeline",
+                        "props": {"density": "compact"},
+                        "content": timeline_items,
+                    }
                 ],
-            })
-
-        if not timeline_items:
-            return {"cols": 12, "md": 6}, attrs, empty
-
-        return (
-            {"cols": 12, "md": 8},
-            attrs,
-            [
-                {
-                    # VTimelineItem 必须放在 VTimeline 里，否则时间线渲染不出来
-                    "component": "VTimeline",
-                    "props": {"density": "compact"},
-                    "content": timeline_items,
-                }
-            ],
-        )
+            )
+        finally:
+            self._flush_images()
 
     # ---------------- 仪表盘辅助 ----------------
 
@@ -889,17 +938,63 @@ class DoubanArchive(_PluginBase):
         except Exception:
             return None
 
-    @staticmethod
-    def _build_card(record: Dict[str, Any], mobile: bool) -> Optional[Dict[str, Any]]:
+    def _prepare_images(self) -> None:
+        """渲染前准备好图片缓存，并为本次渲染分配回源预算。"""
+        if not self._image_map:
+            self._image_map = dict(self.get_data(_KEY_IMAGES) or {})
+        self._image_cache = self._image_map
+        self._image_budget = _INLINE_BUDGET
+        self._image_dirty = False
+
+    def _flush_images(self) -> None:
+        """渲染结束后把新增的 data URI 落盘，下次直接使用。"""
+        if not self._image_dirty:
+            return
+        mapping = dict(self._image_map)
+        # 超量时丢掉最早写入的一批，避免缓存无限增长
+        if len(mapping) > _IMAGE_CACHE_MAX:
+            for key in list(mapping.keys())[:len(mapping) - _IMAGE_CACHE_MAX]:
+                mapping.pop(key, None)
+        self.save_data(_KEY_IMAGES, mapping)
+        self._image_dirty = False
+
+    def _resolve_image(self, record: Dict[str, Any]) -> str:
+        """
+        返回可直接展示的图片地址。
+        豆瓣图片有防盗链（带本站 Referer 会 403），因此由后端取回后内联为 data URI。
+        """
+        image = str(record.get("image") or "")
+        if not image or "doubanio.com" not in image:
+            return image
+
+        cached = self._image_map.get(image)
+        if cached:
+            return cached
+        if not self._inline_image or image in self._image_failed:
+            return ""
+        if len(self._image_map) >= self._inline_limit or self._image_budget <= 0:
+            # 超出上限或本次预算用尽，先占位，后续刷新继续补齐
+            return ""
+
+        self._image_budget -= 1
+        uri = DoubanClient().fetch_image_data_uri(image)
+        if not uri:
+            self._image_failed.add(image)
+            return ""
+        self._image_map[image] = uri
+        self._image_dirty = True
+        return uri
+
+    def _build_card(self, record: Dict[str, Any], mobile: bool) -> Optional[Dict[str, Any]]:
         """把一条档案记录渲染成海报卡片；没有豆瓣条目就无处跳转，直接跳过。"""
         subject_id = str(record.get("subject_id") or "")
         if not subject_id:
             return None
 
         title = str(record.get("title") or record.get("subject_name") or "")
-        status = DoubanArchive._status_text(str(record.get("status") or ""))
+        status = self._status_text(str(record.get("status") or ""))
         width, height = ("44px", "66px") if mobile else ("66px", "99px")
-        image = str(record.get("image") or "")
+        image = self._resolve_image(record)
 
         if image:
             body = [
