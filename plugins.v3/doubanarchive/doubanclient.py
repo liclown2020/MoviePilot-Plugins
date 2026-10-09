@@ -52,10 +52,13 @@ class DoubanClient:
         搜索豆瓣影视条目，返回 (条目标题, subject_id)。
         优先使用 MP 内置的 frodo API（与「豆瓣想看」同通道，反爬宽松），
         不可用时回退网页搜索。
+
+        注意：底层实现失败时返回的是 (None, None) 元组而非 None，
+        因此必须判断 subject_id 是否为空，否则会拿到空结果却不再回退。
         """
-        result = self._search_by_frodo(title, media_type)
-        if result is not None:
-            return result
+        subject_name, subject_id = self._search_by_frodo(title, media_type)
+        if subject_id:
+            return subject_name, subject_id
         return self._search_by_web(title)
 
     def set_status(self, subject_id: str, status: str = "do", private: bool = True) -> bool:
