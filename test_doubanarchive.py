@@ -645,12 +645,13 @@ def test_rescan_not_found(DoubanArchive):
     return "skipped"
 
 
-@case("重扫：cookie 为空时中止，不动档案")
+@case("重扫：未登录时中止，不动档案")
 def test_rescan_no_cookie(DoubanArchive):
     plugin = DoubanArchive()
     plugin._enabled = True
     plugin._cookie = ""
     plugin._use_cookiecloud = False
+    plugin._lock = __import__("threading").Lock()
     plugin.save_data("archive", {
         "某剧_S1": {"title": "某剧", "subject_name": "某剧", "subject_id": "4",
                     "season": 1, "episode": 5, "type": "电视剧", "status": "do"},
@@ -660,13 +661,21 @@ def test_rescan_no_cookie(DoubanArchive):
         def search_series(self, title, season=0):
             raise AssertionError("无 cookie 不该查媒体服务器")
 
+    class _C:
+        def has_login(self):
+            return False
+
+        def diagnose_login(self):
+            return {"missing_keys": ["login_flag"], "logged_in": False}
+
     import doubanarchive as mod
-    orig_reader = plugin._reader
+    orig_reader, orig_client = plugin._reader, mod.DoubanClient
     plugin._reader = lambda *a, **k: _R()
+    mod.DoubanClient = lambda *a, **k: _C()
     try:
         result = plugin.rescan_archive()
     finally:
-        plugin._reader = orig_reader
+        plugin._reader, mod.DoubanClient = orig_reader, orig_client
 
     assert result["failed"] == 1, result
     assert plugin.get_data("archive")["某剧_S1"]["status"] == "do"
@@ -1005,6 +1014,84 @@ def test_user_id_missing(DoubanArchive):
     reader.get_season_play_state("1", 1)
     assert "userId=" not in seen["url"], seen["url"]
     return "无 userId（已回退）"
+
+
+
+@case("豆瓣搜索：frodo 返回 (None,None) 时回退网页搜索")
+def test_search_fallback_when_frodo_empty(DoubanArchive):
+    sys.path.insert(0, r"C://Users//Li//WorkBuddy//2026-10-09-10-31-43//mp-plugins//plugins.v3")
+    from doubanarchive.doubanclient import DoubanClient
+    client = DoubanClient.__new__(DoubanClient)
+    # frodo 搜不到时返回的是元组 (None, None)，不是 None
+    client._search_by_frodo = lambda title, media_type: (None, None)
+    client._search_by_web = lambda title: ("网页搜到的", "web-123")
+    name, sid = client.search("老舅", "TV")
+    # 必须回退到网页搜索，而不是把 (None, None) 当有效结果直接返回
+    assert sid == "web-123", sid
+    assert name == "网页搜到的", name
+    return f"回退成功 -> {sid}"
+
+
+@case("豆瓣搜索：frodo 有结果时不走网页搜索")
+def test_search_no_fallback_when_found(DoubanArchive):
+    sys.path.insert(0, r"C://Users//Li//WorkBuddy//2026-10-09-10-31-43//mp-plugins//plugins.v3")
+    from doubanarchive.doubanclient import DoubanClient
+    client = DoubanClient.__new__(DoubanClient)
+    client._search_by_frodo = lambda title, media_type: ("frodo结果", "fr-1")
+    called = []
+
+    def web(title):
+        called.append(title)
+        return ("网页结果", "web-1")
+
+    client._search_by_web = web
+    name, sid = client.search("征途", "TV")
+    assert sid == "fr-1", sid
+    assert not called, "有结果时不该再走网页搜索"
+    return "直接返回 frodo 结果"
+
+
+@case("登录态：匿名 cookie 不算已登录")
+def test_login_anon_cookie(DoubanArchive):
+    sys.path.insert(0, r"C://Users//Li//WorkBuddy//2026-10-09-10-31-43//mp-plugins//plugins.v3")
+    from doubanarchive.doubanclient import DoubanClient
+    # 未登录访问豆瓣也会下发这批统计类 cookie
+    client = DoubanClient(cookie="_ga=GA1.1.1; bid=xyz; ck=KTm4; dbcl2=\"123\"")
+    assert client.has_login() is False, "匿名 cookie 不应判为已登录"
+    return "匿名 cookie 已识别"
+
+
+@case("登录态：缺少 login_flag 或 db_sid 即未登录")
+def test_login_missing_keys(DoubanArchive):
+    sys.path.insert(0, r"C://Users//Li//WorkBuddy//2026-10-09-10-31-43//mp-plugins//plugins.v3")
+    from doubanarchive.doubanclient import DoubanClient
+    assert DoubanClient(cookie="login_flag=x; _ga=y").has_login() is False
+    assert DoubanClient(cookie="db_sid=y; _ga=x").has_login() is False
+    return "缺任一关键项即未登录"
+
+
+@case("登录态：含 login_flag 与 db_sid 视为已登录")
+def test_login_ok(DoubanArchive):
+    sys.path.insert(0, r"C://Users//Li//WorkBuddy//2026-10-09-10-31-43//mp-plugins//plugins.v3")
+    from doubanarchive.doubanclient import DoubanClient
+    client = DoubanClient(cookie="login_flag=x; db_sid=y; UE=z; _ga=w")
+    assert client.has_login() is True
+    return "已登录"
+
+
+@case("登录诊断：报出缺失项与实测搜索结果")
+def test_login_diagnose(DoubanArchive):
+    sys.path.insert(0, r"C://Users//Li//WorkBuddy//2026-10-09-10-31-43//mp-plugins//plugins.v3")
+    from doubanarchive.doubanclient import DoubanClient
+    client = DoubanClient(cookie="_ga=1; bid=2")
+    client.search = lambda title, media_type: (None, None)
+    detail = client.diagnose_login()
+    assert detail["logged_in"] is False, detail
+    assert "login_flag" in detail["missing_keys"], detail
+    assert "db_sid" in detail["missing_keys"], detail
+    assert detail["probe_ok"] is False, detail
+    assert detail["hint"], detail
+    return f"缺 {detail['missing_keys']}"
 
 
 def main():
