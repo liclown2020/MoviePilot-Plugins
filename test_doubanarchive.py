@@ -462,6 +462,9 @@ def test_rescan_upgrade(DoubanArchive):
         def search_series(self, title, season=0):
             return "emby-series-1"
 
+        def get_season_episodes(self, series_id, season):
+            return list(range(1, 29))
+
         def get_season_play_state(self, series_id, season):
             return {i: True for i in range(1, 29)}   # 28 集全看完
 
@@ -503,6 +506,9 @@ def test_rescan_partial(DoubanArchive):
     class _R:
         def search_series(self, title, season=0):
             return "s-2"
+
+        def get_season_episodes(self, series_id, season):
+            return list(range(1, 29))
 
         def get_season_play_state(self, series_id, season):
             state = {i: True for i in range(1, 29)}
@@ -701,6 +707,148 @@ def test_search_series_fallback(DoubanArchive):
     reader._located_name = "emby"
     assert reader.search_series("征途") == "y1"
     return "y1"
+
+
+@case("重扫：逐条记录 trace，含未看完集号")
+def test_rescan_trace(DoubanArchive):
+    plugin = DoubanArchive()
+    plugin._enabled = True
+    plugin._cookie = "ck=x"
+    plugin._lock = __import__("threading").Lock()
+    plugin.save_data("archive", {
+        "某剧_S1": {"title": "某剧", "subject_name": "某剧", "subject_id": "7",
+                    "season": 1, "episode": 6, "type": "电视剧", "status": "do"},
+    })
+
+    class _R:
+        def search_series(self, title, season=0):
+            return "s-7"
+
+        def get_season_episodes(self, series_id, season):
+            return [1, 2, 3, 4, 5, 6]
+
+        def get_season_play_state(self, series_id, season):
+            return {1: True, 2: True, 3: True, 4: True, 5: True, 6: False}
+
+    class _C:
+        def has_login(self):
+            return True
+
+        def set_status(self, *a, **k):
+            raise AssertionError("未看完不应写豆瓣")
+
+    import doubanarchive as mod
+    orig_reader, orig_client = plugin._reader, mod.DoubanClient
+    plugin._reader = lambda *a, **k: _R()
+    mod.DoubanClient = lambda *a, **k: _C()
+    try:
+        result = plugin.rescan_archive()
+    finally:
+        plugin._reader, mod.DoubanClient = orig_reader, orig_client
+
+    trace = result["trace"][0]
+    assert trace["played_true"] == 5, trace
+    assert trace["played_false"] == 1, trace
+    assert trace["unfinished"] == [6], trace
+    assert "未看完 1 集" in trace["result"], trace
+    # 诊断数据要落盘，便于事后排查
+    diag = plugin.get_data("diagnose")
+    assert diag and diag["trace"][0]["title"] == "某剧"
+    return trace["result"]
+
+
+@case("重扫：搜索不到剧集时 trace 记录原因")
+def test_rescan_trace_notfound(DoubanArchive):
+    plugin = DoubanArchive()
+    plugin._enabled = True
+    plugin._cookie = "ck=x"
+    plugin._lock = __import__("threading").Lock()
+    plugin.save_data("archive", {
+        "某剧_S1": {"title": "某剧", "subject_name": "某剧", "subject_id": "8",
+                    "season": 1, "episode": 3, "type": "电视剧", "status": "do"},
+    })
+
+    class _R:
+        def search_series(self, title, season=0):
+            return None
+
+    class _C:
+        def has_login(self):
+            return True
+
+        def set_status(self, *a, **k):
+            raise AssertionError("不应写豆瓣")
+
+    import doubanarchive as mod
+    orig_reader, orig_client = plugin._reader, mod.DoubanClient
+    plugin._reader = lambda *a, **k: _R()
+    mod.DoubanClient = lambda *a, **k: _C()
+    try:
+        result = plugin.rescan_archive()
+    finally:
+        plugin._reader, mod.DoubanClient = orig_reader, orig_client
+
+    assert "未搜到" in result["trace"][0]["result"], result["trace"]
+    return result["trace"][0]["result"]
+
+
+@case("重扫：写入豆瓣失败计入 failed 且不改状态")
+def test_rescan_douban_fail(DoubanArchive):
+    plugin = DoubanArchive()
+    plugin._enabled = True
+    plugin._cookie = "ck=x"
+    plugin._lock = __import__("threading").Lock()
+    plugin.save_data("archive", {
+        "某剧_S1": {"title": "某剧", "subject_name": "某剧", "subject_id": "9",
+                    "season": 1, "episode": 4, "type": "电视剧", "status": "do"},
+    })
+
+    class _R:
+        def search_series(self, title, season=0):
+            return "s-9"
+
+        def get_season_episodes(self, series_id, season):
+            return [1, 2, 3, 4]
+
+        def get_season_play_state(self, series_id, season):
+            return {i: True for i in range(1, 5)}
+
+    class _C:
+        def has_login(self):
+            return True
+
+        def set_status(self, *a, **k):
+            return False
+
+    import doubanarchive as mod
+    orig_reader, orig_client = plugin._reader, mod.DoubanClient
+    plugin._reader = lambda *a, **k: _R()
+    mod.DoubanClient = lambda *a, **k: _C()
+    try:
+        result = plugin.rescan_archive()
+    finally:
+        plugin._reader, mod.DoubanClient = orig_reader, orig_client
+
+    assert result["failed"] == 1, result
+    assert result["upgraded"] == 0, result
+    assert "写入豆瓣失败" in result["trace"][0]["result"], result["trace"]
+    assert plugin.get_data("archive")["某剧_S1"]["status"] == "do"
+    return "failed=1，状态未变"
+
+
+@case("重扫开关：勾选后延迟执行，不立即清除")
+def test_rescan_flag_persists(DoubanArchive):
+    plugin = DoubanArchive()
+    plugin._lock = __import__("threading").Lock()
+    scheduled = {}
+    plugin._schedule_once = lambda job_id, func, name, delay: scheduled.update(
+        {"job": job_id, "delay": delay})
+    plugin.update_config = lambda config, plugin_id=None: True
+    plugin.init_plugin({"enabled": True, "rescan": True})
+    # 开关不能在这里被清掉，否则任务会被静默取消
+    assert scheduled.get("job") == "rescan_archive_once", scheduled
+    assert scheduled.get("delay") == 5, scheduled
+    return f"delay={scheduled['delay']}"
 
 
 def main():

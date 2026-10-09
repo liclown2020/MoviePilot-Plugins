@@ -68,11 +68,26 @@ v1.3.0 之前的存量数据无法自动修正——插件当时只在开播那�
 
 | 方式 | 操作 |
 | --- | --- |
-| 配置页 | 勾选「重扫档案」后保存 |
+| 配置页 | 勾选「重扫档案」后保存（任务延迟 5 秒执行，结束后自动复位开关） |
 | 远程命令 | 发送 `/douban_rescan` |
-| API | `POST /api/v1/plugin/DoubanArchive/rescan` |
+| API | `POST /api/v1/plugin/DoubanArchive/rescan`（同步执行，直接返回逐条结果） |
 
 判定逻辑：按标题定位剧集 → 读该季所有集的 `UserData.Played` → **整季全部已播放**才标「看过」。
+
+### 排查
+
+`GET /api/v1/plugin/DoubanArchive/diagnose` 返回每个环节的实际读取结果，
+不依赖 MP 日志就能定位问题：
+
+| 字段 | 含义 |
+| --- | --- |
+| `series_id` | 搜到的剧集 ID，为空说明标题没匹配上 |
+| `episodes_count` | 该季实际集数 |
+| `played_true` / `played_false` | 已播放 / 未播放集数 |
+| `unfinished` | 具体哪些集没看完 |
+| `result` | 本条的处理结论 |
+
+`POST /rescan` 的返回值里 `trace` 字段是同样结构，同时带豆瓣写入结果。
 
 安全约束（避免误伤）：
 

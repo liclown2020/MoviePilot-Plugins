@@ -48,6 +48,8 @@ _KEY_ARCHIVE = "archive"
 _KEY_PENDING = "pending"
 # 仪表盘 key，宿主用它区分同一插件的多个仪表盘
 _KEY_DASHBOARD = "archive"
+# 重扫诊断结果键，便于排查「为什么没有升级」
+_KEY_DIAG = "diagnose"
 # 豆瓣图片 data URI 缓存键（避免每次刷新都回源）
 _KEY_IMAGES = "images"
 # 单次渲染最多回源几张图，避免仪表盘请求太久
@@ -63,7 +65,7 @@ class DoubanArchive(_PluginBase):
     plugin_name = "豆瓣档案同步"
     plugin_desc = "将在看、看完状态同步到豆瓣书影音档案，不依赖 TMDB 识别，失败自动重试。"
     plugin_icon = "Douban_A.png"
-    plugin_version = "1.4.0"
+    plugin_version = "1.4.1"
     plugin_author = "liclown2020"
     author_url = "https://github.com/liclown2020"
     plugin_config_prefix = "doubanarchive_"
@@ -134,10 +136,11 @@ class DoubanArchive(_PluginBase):
             self.update_config(config)
 
         if config.get("rescan"):
-            # 勾选重扫档案：按媒体服务器真实播放状态校正历史条目
-            self._schedule_once("rescan_archive_once", self.rescan_archive, "重扫豆瓣档案", 3)
-            config["rescan"] = False
-            self.update_config(config)
+            # 勾选重扫档案：按媒体服务器真实播放状态校正历史条目。
+            # 这里不立刻改回 False，而是由重扫任务自身收尾时清除，
+            # 避免前端开关保存失败时任务被静默取消。
+            self._schedule_once("rescan_archive_once", self.rescan_archive, "重扫豆瓣档案", 5)
+            logger.info("已登记重扫档案任务，稍后执行")
 
         if self._enabled:
             logger.info("豆瓣档案同步插件已启用")
@@ -199,15 +202,84 @@ class DoubanArchive(_PluginBase):
                 "auth": "bear",
                 "summary": "重扫档案并校正状态",
             },
+            {
+                "path": "/diagnose",
+                "endpoint": self.api_diagnose,
+                "methods": ["GET"],
+                "auth": "bear",
+                "summary": "重扫诊断：逐条展示每个环节的读取结果",
+            },
         ]
 
     def api_rescan(self) -> Dict[str, Any]:
         """
-        重扫接口的实际处理函数。
-        扫描涉及多次外部请求，放到延后任务执行，接口立即返回避免请求超时。
+        重扫接口：同步执行并直接返回逐条结果。
+
+        早期版本把重扫丢进延后任务，接口立即返回「已提交」，
+        失败时无处可查——实际排查时无法确认任务是否跑、卡在哪一步。
+        这里改为同步执行：档案条数有限（通常几十条），耗时可接受，
+        调用方能直接拿到每一档的处理结果。
         """
-        self._schedule_once("rescan_archive_once", self.rescan_archive, "重扫豆瓣档案", 3)
-        return {"scheduled": True, "message": "重扫任务已提交，完成后查看 MP 日志"}
+        if not self._enabled:
+            return {"success": False, "message": "插件未启用"}
+        return self.rescan_archive()
+
+    def api_diagnose(self) -> Dict[str, Any]:
+        """
+        重扫诊断接口。
+
+        重扫依赖「搜索剧集 → 读集列表 → 读播放状态 → 写豆瓣」四个环节，
+        任一环失败都只会体现为「没升级」，难以定位。本接口把每一步的
+        实际返回都记录下来，便于确认真实原因。
+        """
+        report: Dict[str, Any] = {"server": self._server, "items": []}
+        archive = dict(self.get_data(_KEY_ARCHIVE) or {})
+        reader = self._reader()
+        report["libraries"] = reader.get_librarys()
+
+        for key, record in archive.items():
+            if not isinstance(record, dict):
+                continue
+            entry: Dict[str, Any] = {
+                "key": key,
+                "title": record.get("subject_name") or record.get("title") or key,
+                "type": record.get("type"),
+                "season": record.get("season"),
+                "status": record.get("status"),
+            }
+            if not str(record.get("type") or "").startswith("电视剧"):
+                entry["result"] = "跳过：非剧集"
+                report["items"].append(entry)
+                continue
+            try:
+                series_id = reader.search_series(entry["title"], self._to_int(record.get("season"), 0, 0))
+                entry["series_id"] = series_id or ""
+                if not series_id:
+                    entry["result"] = "未搜索到剧集条目"
+                    report["items"].append(entry)
+                    continue
+
+                season = self._to_int(record.get("season"), 0, 0)
+                episodes = reader.get_season_episodes(series_id, season)
+                entry["episodes_count"] = len(episodes)
+                entry["episodes"] = episodes[:60]
+
+                state = reader.get_season_play_state(series_id, season)
+                entry["played_true"] = sum(1 for value in state.values() if value)
+                entry["played_false"] = sum(1 for value in state.values() if not value)
+                entry["played_total"] = len(state)
+                if not state:
+                    entry["result"] = "未读取到任何集"
+                elif all(state.values()):
+                    entry["result"] = "整季已看完，应升级为看过"
+                else:
+                    entry["result"] = "存在未看完的集，保持在看"
+            except Exception as error:
+                entry["result"] = f"异常：{type(error).__name__}: {error}"
+            report["items"].append(entry)
+
+        self.save_data(_KEY_DIAG, report)
+        return report
 
     def stop_service(self) -> None:
         """停止时取消未执行的延后任务并关闭状态。"""
@@ -405,52 +477,94 @@ class DoubanArchive(_PluginBase):
         logger.info(f"开始重扫豆瓣档案，共 {summary['total']} 条")
 
         updates: Dict[str, Dict[str, Any]] = {}
+        trace: List[Dict[str, Any]] = []
         for key, record in archive.items():
             if not isinstance(record, dict):
                 continue
+            title = str(record.get("subject_name") or record.get("title") or key)
+            step: Dict[str, Any] = {"title": title, "season": record.get("season")}
+            trace.append(step)
+
             if record.get("status") == "collect":
+                step["result"] = "已是看过，跳过"
                 summary["skipped"] += 1
                 continue
             # 电影没有集号概念，不参与重扫
             if not str(record.get("type") or "").startswith("电视剧"):
+                step["result"] = "非剧集，跳过"
                 summary["skipped"] += 1
                 continue
 
-            title = str(record.get("subject_name") or record.get("title") or key)
             season = self._to_int(record.get("season"), 0, 0)
             subject_id = str(record.get("subject_id") or "")
             if not subject_id:
+                step["result"] = "档案缺少豆瓣 ID，跳过"
                 summary["skipped"] += 1
                 continue
 
             try:
                 series_id = reader.search_series(title, season)
+                step["series_id"] = series_id or ""
                 if not series_id:
+                    step["result"] = "媒体服务器未搜到该剧集"
                     logger.warn(f"{title} 在媒体服务器中未找到对应剧集，跳过")
                     summary["skipped"] += 1
                     continue
+
+                episodes = reader.get_season_episodes(series_id, season)
                 state = reader.get_season_play_state(series_id, season)
+                step["episodes_count"] = len(episodes)
+                step["played_total"] = len(state)
+                step["played_true"] = sum(1 for value in state.values() if value)
+                step["played_false"] = sum(1 for value in state.values() if not value)
+
                 if not state:
+                    step["result"] = "未读取到任何集"
                     logger.warn(f"{title} 第{season}季未读取到任何集，跳过")
                     summary["skipped"] += 1
                     continue
-                # 整季全部已播放才算看完
-                if not all(state.values()):
+
+                played_true = sum(1 for value in state.values() if value)
+                if played_true < len(state):
+                    # 把未看完的集号记下来，便于判断是哪几集没看
+                    unfinished = [index for index, value in sorted(state.items()) if not value]
+                    step["unfinished"] = unfinished[:20]
+                    step["result"] = f"未看完 {len(unfinished)} 集，保持在看"
                     summary["skipped"] += 1
                     continue
+
+                step["result"] = "整季已看完，尝试写入豆瓣"
             except Exception as error:
+                step["result"] = f"读取异常：{type(error).__name__}: {error}"
                 logger.warn(f"重扫 {title} 读取播放状态失败：{error}")
                 summary["failed"] += 1
                 continue
 
             if client.set_status(subject_id=subject_id, status="collect", private=self._private):
+                step["result"] = "写入豆瓣成功，已升级为看过"
                 logger.info(f"{title} 第{season}季已看完，重扫后标记为看过")
                 updates[key] = record
                 summary["upgraded"] += 1
                 summary["details"].append(title)
             else:
+                step["result"] = "写入豆瓣失败"
                 logger.warn(f"{title} 重扫后写入豆瓣失败")
                 summary["failed"] += 1
+
+        summary["trace"] = trace
+        self.save_data(_KEY_DIAG, {
+            "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "summary": {k: v for k, v in summary.items() if k != "trace"},
+            "trace": trace,
+        })
+        # 任务已执行，主动清掉配置里的开关，避免下次启用插件时重复触发
+        try:
+            current = self.get_config() or {}
+            if isinstance(current, dict) and current.get("rescan"):
+                current["rescan"] = False
+                self.update_config(current)
+        except Exception as error:
+            logger.debug(f"清除重扫开关失败：{error}")
 
         if updates:
             with self._lock:
