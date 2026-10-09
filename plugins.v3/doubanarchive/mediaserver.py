@@ -21,14 +21,22 @@ class MediaServerReader:
     读取失败统一返回空值，由调用方降级。
     """
 
-    def __init__(self, server_name: Optional[str] = None, timeout: int = 15) -> None:
+    def __init__(self, server_name: Optional[str] = None, timeout: int = 15,
+                 username: Optional[str] = None) -> None:
         """
         :param server_name: 媒体服务器名称，为空时取第一个可用实例
         :param timeout: 预留的超时设置，实例自身已有默认超时
+        :param username: 用于查询播放状态的用户名。
+            播放状态按用户隔离，必须指定实际看剧的账号，
+            否则取到的是管理员（宿主默认用 SUPERUSER）的播放记录。
         """
         self._server_name = server_name
         self._timeout = timeout
+        self._username = (username or "").strip()
         self._cache: Dict[Tuple[str, str], Any] = {}
+        # 运行时解析出的 userId，解析失败时回退到宿主默认（管理员）
+        self._user_id: Optional[str] = None
+        self._user_resolved = False
 
     # ---------------- 对外能力 ----------------
 
@@ -162,8 +170,10 @@ class MediaServerReader:
 
         response = self._get(
             instance,
-            f"[HOST]emby/Shows/{series_id}/Episodes?Season={season_no}"
-            f"&IsMissing=false&api_key=[APIKEY]",
+            self._user_scope_url(
+                instance,
+                f"/emby/Shows/{series_id}/Episodes?Season={season_no}&IsMissing=false",
+            ),
         )
         items = response.get("Items") if isinstance(response, dict) else None
         played: Optional[bool] = None
@@ -249,6 +259,57 @@ class MediaServerReader:
         self._cache[cache_key] = result
         return result
 
+    def _resolve_user_id(self, instance: Any) -> Optional[str]:
+        """
+        解析用于查询播放状态的 userId。
+
+        播放状态（UserData.Played）在媒体服务器里是按用户隔离的，
+        宿主的 [USER] 占位符固定替换为管理员（SUPERUSER），
+        管理员没看过的剧会返回 Played=false，导致「明明看完却判定未看完」。
+        这里按配置的用户名解析真实 userId，解析不到才退回宿主默认。
+        """
+        if self._user_resolved:
+            return self._user_id
+        self._user_resolved = True
+
+        if not self._username:
+            self._user_id = None
+            return None
+
+        try:
+            users = instance.get_data("[HOST]Users?api_key=[APIKEY]")
+            if users is None or getattr(users, "status_code", None) != 200:
+                return None
+            data = users.json()
+        except Exception as error:
+            logger.debug(f"读取媒体服务器用户列表失败：{error}")
+            return None
+
+        if not isinstance(data, list):
+            return None
+        for user in data:
+            if isinstance(user, dict) and str(user.get("Name") or "") == self._username:
+                self._user_id = str(user.get("Id") or "") or None
+                if self._user_id:
+                    logger.debug(f"播放状态查询使用用户 {self._username}（{self._user_id}）")
+                return self._user_id
+
+        logger.warn(f"媒体服务器中未找到用户 {self._username}，播放状态可能不准确")
+        self._user_id = None
+        return None
+
+    def _user_scope_url(self, instance: Any, path: str) -> str:
+        """
+        拼接带用户维度的查询地址。
+        能解析到 userId 时用它，确保读到的播放状态属于真实看剧账号。
+        """
+        user_id = self._resolve_user_id(instance)
+        api_key = getattr(instance, "_apikey", "")
+        host = getattr(instance, "_host", "") or ""
+        base = f"{host.rstrip('/')}{path}"
+        params = f"?userId={user_id}" if user_id else ""
+        return f"{base}{params}&api_key={api_key}"
+
     def get_season_play_state(self, series_id: str, season_no: int) -> Dict[int, bool]:
         """
         一次性读取某一季所有集的已播放状态，返回 {集号: 是否已播放}。
@@ -264,11 +325,11 @@ class MediaServerReader:
         if cache_key in self._cache:
             return dict(self._cache[cache_key])
 
-        response = self._get(
+        url = self._user_scope_url(
             instance,
-            f"[HOST]emby/Shows/{series_id}/Episodes?Season={season_no}"
-            f"&IsMissing=false&api_key=[APIKEY]",
+            f"/emby/Shows/{series_id}/Episodes?Season={season_no}&IsMissing=false",
         )
+        response = self._get(instance, url)
         items = response.get("Items") if isinstance(response, dict) else None
         state: Dict[int, bool] = {}
         for entry in items or []:
