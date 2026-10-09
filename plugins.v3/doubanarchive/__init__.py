@@ -65,7 +65,7 @@ class DoubanArchive(_PluginBase):
     plugin_name = "豆瓣档案同步"
     plugin_desc = "将在看、看完状态同步到豆瓣书影音档案，不依赖 TMDB 识别，失败自动重试。"
     plugin_icon = "Douban_A.png"
-    plugin_version = "1.6.0"
+    plugin_version = "1.7.0"
     plugin_author = "liclown2020"
     author_url = "https://github.com/liclown2020"
     plugin_config_prefix = "doubanarchive_"
@@ -142,6 +142,12 @@ class DoubanArchive(_PluginBase):
             self._schedule_once("rescan_archive_once", self.rescan_archive, "重扫豆瓣档案", 5)
             logger.info("已登记重扫档案任务，稍后执行")
 
+        if config.get("scan"):
+            # 勾选全量扫描：遍历媒体库，把已看完的剧集补进档案。
+            # 扫描耗时较长（每个剧集都要读一次播放状态），放到后台任务执行。
+            self._schedule_once("scan_library_once", self.scan_library, "全量扫描媒体库", 5)
+            logger.info("已登记全量扫描任务，稍后执行")
+
         if self._enabled:
             logger.info("豆瓣档案同步插件已启用")
         else:
@@ -168,6 +174,13 @@ class DoubanArchive(_PluginBase):
                 "desc": "重扫档案，按媒体服务器播放状态校正",
                 "category": "插件命令",
                 "data": {"action": "douban_rescan"},
+            },
+            {
+                "cmd": "/douban_scan",
+                "event": EventType.PluginAction,
+                "desc": "全量扫描媒体库，导入已看完的剧集",
+                "category": "插件命令",
+                "data": {"action": "douban_scan"},
             },
         ]
 
@@ -208,6 +221,13 @@ class DoubanArchive(_PluginBase):
                 "methods": ["GET"],
                 "auth": "bear",
                 "summary": "重扫诊断：逐条展示每个环节的读取结果",
+            },
+            {
+                "path": "/scan",
+                "endpoint": self.api_scan_library,
+                "methods": ["POST"],
+                "auth": "bear",
+                "summary": "全量扫描媒体库并导入已看完的剧集",
             },
         ]
 
@@ -348,6 +368,8 @@ class DoubanArchive(_PluginBase):
             self.retry_pending()
         elif action == "douban_rescan":
             self.rescan_archive()
+        elif action == "douban_scan":
+            self.scan_library()
 
     # ---------------- 同步主流程 ----------------
 
@@ -585,6 +607,156 @@ class DoubanArchive(_PluginBase):
             logger.info("重扫完成：没有需要升级的条目")
 
         return summary
+
+    def scan_library(self) -> Dict[str, Any]:
+        """
+        全量扫描媒体库，把已看完的剧集导入豆瓣档案。
+
+        与重扫的区别：重扫只处理「已在档案里」的条目，而档案完全依赖播放事件，
+        没被播放事件触发过的剧集（如《老舅》）永远进不来。
+        本方法直接遍历媒体库全部剧集，按真实播放状态补建档案。
+
+        安全约束：
+        - 只导入「整季全部已看完」的剧集，未看完的一律跳过；
+        - 档案里已有的条目不覆盖，只补充缺失的；
+        - 豆瓣条目按媒体服务器刮削的豆瓣 ID 优先，取不到才搜索。
+        """
+        summary = {"libraries": 0, "scanned": 0, "watched": 0, "imported": 0,
+                   "skipped": 0, "failed": 0, "items": []}
+        if not self._enabled:
+            logger.warn("插件未启用，无法扫描媒体库")
+            return summary
+
+        client = DoubanClient(cookie=self._load_cookie())
+        if not client.has_login():
+            logger.error("豆瓣 cookie 为空，无法导入")
+            summary["failed"] = 1
+            return summary
+
+        selected = self._selected_libraries()
+        reader = self._reader()
+        libraries = reader.get_librarys()
+        if selected:
+            libraries = [lib for lib in libraries if lib["name"] in selected]
+        if not libraries:
+            logger.warn("未找到可扫描的媒体库")
+            return summary
+
+        summary["libraries"] = len(libraries)
+        with self._lock:
+            archive = dict(self.get_data(_KEY_ARCHIVE) or {})
+        existing = set(archive.keys())
+        logger.info(f"开始扫描媒体库，共 {len(libraries)} 个库，"
+                    f"已有档案 {len(existing)} 条")
+
+        updates: Dict[str, Dict[str, Any]] = {}
+        for library in libraries:
+            series_list = reader.list_library_series(library["id"])
+            logger.info(f"媒体库「{library['name']}」共 {len(series_list)} 个剧集")
+            for series in series_list:
+                series_id = series["id"]
+                title = series["name"]
+                summary["scanned"] += 1
+
+                state = self._season_state_of_any_user(reader, series_id)
+                if not state:
+                    summary["skipped"] += 1
+                    continue
+
+                # 找出所有整季看完的季
+                for season, episodes in sorted(state.items()):
+                    if not episodes or not all(episodes.values()):
+                        continue
+                    summary["watched"] += 1
+                    key = self._archive_key(title, "TV", season)
+                    if key in existing or key in updates:
+                        summary["skipped"] += 1
+                        continue
+
+                    record = self._build_scan_record(series, season, episodes)
+                    if not record:
+                        summary["skipped"] += 1
+                        continue
+
+                    douban_id = record["subject_id"]
+                    if not douban_id:
+                        subject_name, found = self._search_subject(
+                            title, season, "TV")
+                        if not found:
+                            summary["skipped"] += 1
+                            continue
+                        record["subject_id"] = douban_id
+                        record["subject_name"] = subject_name
+
+                    if client.set_status(subject_id=douban_id,
+                                         status="collect", private=self._private):
+                        updates[key] = record
+                        summary["imported"] += 1
+                        summary["items"].append(
+                            f"{title} 第{season}季（{len(episodes)}集）")
+                        logger.info(f"导入 {title} 第{season}季 为看过")
+                    else:
+                        summary["failed"] += 1
+
+        if updates:
+            with self._lock:
+                current = dict(self.get_data(_KEY_ARCHIVE) or {})
+                stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                for key, record in updates.items():
+                    record["timestamp"] = stamp
+                    current[key] = record
+                self.save_data(_KEY_ARCHIVE, current)
+
+        logger.info(f"扫描完成：检查 {summary['scanned']} 个剧集，"
+                    f"看完 {summary['watched']} 季，新增 {summary['imported']} 条")
+        return summary
+
+    def _season_state_of_any_user(self, reader: MediaServerReader,
+                                  series_id: str) -> Dict[int, Dict[int, bool]]:
+        """汇总所有配置用户的整季播放状态。"""
+        users = self._target_users()
+        if not users:
+            return reader.get_series_season_state(series_id)
+
+        merged: Dict[int, Dict[int, bool]] = {}
+        for username in users:
+            try:
+                state = self._reader(username=username).get_series_season_state(series_id)
+            except Exception as error:
+                logger.debug(f"读取用户 {username} 的播放状态失败：{error}")
+                continue
+            for season, episodes in state.items():
+                target = merged.setdefault(season, {})
+                for index, played in episodes.items():
+                    target[index] = target.get(index, False) or played
+        return merged
+
+    def _build_scan_record(self, series: Dict[str, Any],
+                           season: int, episodes: Dict[int, bool]) -> Dict[str, Any]:
+        """为扫描到的剧集构造档案记录，取不到豆瓣 ID 时 subject_id 留空。"""
+        provider_ids = series.get("provider_ids")
+        douban_id = ""
+        if isinstance(provider_ids, dict):
+            for key, value in provider_ids.items():
+                if str(key).lower() == "douban" and value:
+                    douban_id = str(value).strip()
+                    break
+        return {
+            "title": series["name"],
+            "subject_name": series["name"],
+            "subject_id": douban_id,
+            "season": season,
+            "episode": max(episodes),
+            "type": "电视剧",
+            "status": "collect",
+            "image": "",
+        }
+
+    def api_scan_library(self) -> Dict[str, Any]:
+        """全量扫描接口：同步执行并返回逐条结果。"""
+        if not self._enabled:
+            return {"success": False, "message": "插件未启用"}
+        return self.scan_library()
 
     # ---------------- 数据读写 ----------------
 
@@ -1256,6 +1428,15 @@ class DoubanArchive(_PluginBase):
                                                "label": "重扫档案（按已播放状态校正）"}}
                                 ],
                             },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 6},
+                                "content": [
+                                    {"component": "VSwitch",
+                                     "props": {"model": "scan",
+                                               "label": "全量扫描媒体库（导入已看完的剧）"}}
+                                ],
+                            },
                         ],
                     },
                     {
@@ -1354,6 +1535,7 @@ class DoubanArchive(_PluginBase):
             "cookiecloud_password": "",
             "onlyonce": False,
             "rescan": False,
+            "scan": False,
             "pc_month": 3,
             "pc_num": 50,
             "mobile_month": 2,
