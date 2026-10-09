@@ -226,13 +226,17 @@ def test_movie_high_percentage(DoubanArchive):
     return status
 
 
-@case("剧集 + 末集 + 进度兜底路径：先读标记再判末集，只查一次集数")
+@case("剧集 + 进度兜底路径：已播放为假时直接判在看，不白跑集数查询")
 def test_tv_call_count(DoubanArchive):
     plugin = DoubanArchive()
+    plugin._users = ""
     reader = FakeReader(series_id="s1", played=False, episodes=[1, 2, 3])
-    plugin._resolve_status(
+    # 未配用户名时状态判定内部会自建 Reader，这里让它复用同一个桩件
+    plugin._reader = lambda *a, **k: reader
+    status = plugin._resolve_status(
         {"title": "正途", "event": "PlaybackStop"}, reader, "TV", 1, 3)
     # played 明确为 False 时应直接返回，不再白跑一次集数查询
+    assert status == "do", status
     assert reader.episodes_calls == 0, reader.episodes_calls
     return f"played_calls={reader.played_calls}, episodes_calls={reader.episodes_calls}"
 
@@ -849,6 +853,158 @@ def test_rescan_flag_persists(DoubanArchive):
     assert scheduled.get("job") == "rescan_archive_once", scheduled
     assert scheduled.get("delay") == 5, scheduled
     return f"delay={scheduled['delay']}"
+
+
+@case("多用户：任一用户看完即算看完（取或）")
+def test_multi_user_merge_or(DoubanArchive):
+    plugin = DoubanArchive()
+    plugin._users = "liyawei,tutu"
+    states = {"liyawei": {1: True, 2: False, 3: False}, "tutu": {1: True, 2: True, 3: True}}
+
+    def fake_reader(username=None, **kwargs):
+        class _R:
+            def get_season_play_state(self, series_id, season):
+                return states[username]
+        return _R()
+
+    plugin._reader = fake_reader
+    merged = plugin._play_state_of_any_user("s1", 1)
+    assert merged == {1: True, 2: True, 3: True}, merged
+    return f"合并结果 {merged}"
+
+
+@case("多用户：全部未看完才判未看完")
+def test_multi_user_all_false(DoubanArchive):
+    plugin = DoubanArchive()
+    plugin._users = "a,b"
+    states = {"a": {1: True, 2: False}, "b": {1: True, 2: False}}
+
+    def fake_reader(username=None, **kwargs):
+        class _R:
+            def get_season_play_state(self, series_id, season):
+                return states[username]
+        return _R()
+
+    plugin._reader = fake_reader
+    merged = plugin._play_state_of_any_user("s1", 1)
+    assert merged[2] is False, merged
+    return f"第2集 {merged[2]}"
+
+
+@case("多用户：单集判定，任一看完即 True")
+def test_multi_user_episode(DoubanArchive):
+    plugin = DoubanArchive()
+    plugin._users = "a,b"
+    result_map = {"a": False, "b": True}
+
+    def fake_reader(username=None, **kwargs):
+        class _R:
+            def is_episode_played(self, series_id, season, episode):
+                return result_map[username]
+        return _R()
+
+    plugin._reader = fake_reader
+    assert plugin._is_played_by_any_user("s1", 1, 5) is True
+    return "True"
+
+
+@case("多用户：无人看完且都明确未看 → False")
+def test_multi_user_episode_false(DoubanArchive):
+    plugin = DoubanArchive()
+    plugin._users = "a,b"
+
+    def fake_reader(username=None, **kwargs):
+        class _R:
+            def is_episode_played(self, series_id, season, episode):
+                return False
+        return _R()
+
+    plugin._reader = fake_reader
+    assert plugin._is_played_by_any_user("s1", 1, 5) is False
+    return "False"
+
+
+@case("多用户：查不到任何用户状态 → None（交由上层降级）")
+def test_multi_user_episode_none(DoubanArchive):
+    plugin = DoubanArchive()
+    plugin._users = "a,b"
+
+    def fake_reader(username=None, **kwargs):
+        class _R:
+            def is_episode_played(self, series_id, season, episode):
+                return None
+        return _R()
+
+    plugin._reader = fake_reader
+    assert plugin._is_played_by_any_user("s1", 1, 5) is None
+    return "None"
+
+
+@case("用户名解析：按名称取回 userId 并用于查询")
+def test_user_id_resolve(DoubanArchive):
+    sys.path.insert(0, r"C:\Users\Li\WorkBuddy\2026-10-09-10-31-43\mp-plugins\plugins.v3")
+    from doubanarchive.mediaserver import MediaServerReader
+    reader = MediaServerReader(server_name="emby", username="liyawei")
+    seen = {}
+
+    class _Resp:
+        status_code = 200
+
+        @staticmethod
+        def json():
+            return [{"Id": "u-admin", "Name": "admin"},
+                    {"Id": "u-liy", "Name": "liyawei"}]
+
+    class _Inst:
+        _host = "http://emby:8096"
+        _apikey = "KEY"
+
+        def get_data(self, url):
+            if url.startswith("[HOST]Users"):
+                return _Resp()
+            seen["url"] = url
+            return _Resp()
+
+    reader._located = _Inst()
+    reader._located_type = "emby"
+    reader._located_name = "emby"
+    state = reader.get_season_play_state("120643", 1)
+    # 查询地址必须带上 userId，否则读到的是管理员的播放记录
+    assert "userId=u-liy" in seen["url"], seen["url"]
+    assert "KEY" in seen["url"], seen["url"]
+    return seen["url"].split("?")[1][:40]
+
+
+@case("用户名解析：用户不存在时退回宿主默认，不带 userId")
+def test_user_id_missing(DoubanArchive):
+    sys.path.insert(0, r"C:\Users\Li\WorkBuddy\2026-10-09-10-31-43\mp-plugins\plugins.v3")
+    from doubanarchive.mediaserver import MediaServerReader
+    reader = MediaServerReader(server_name="emby", username="不存在")
+    seen = {}
+
+    class _Resp:
+        status_code = 200
+
+        @staticmethod
+        def json():
+            return [{"Id": "u-admin", "Name": "admin"}]
+
+    class _Inst:
+        _host = "http://emby:8096"
+        _apikey = "KEY"
+
+        def get_data(self, url):
+            if url.startswith("[HOST]Users"):
+                return _Resp()
+            seen["url"] = url
+            return _Resp()
+
+    reader._located = _Inst()
+    reader._located_type = "emby"
+    reader._located_name = "emby"
+    reader.get_season_play_state("1", 1)
+    assert "userId=" not in seen["url"], seen["url"]
+    return "无 userId（已回退）"
 
 
 def main():
