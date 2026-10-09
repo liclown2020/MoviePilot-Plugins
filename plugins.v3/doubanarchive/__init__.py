@@ -65,7 +65,7 @@ class DoubanArchive(_PluginBase):
     plugin_name = "豆瓣档案同步"
     plugin_desc = "将在看、看完状态同步到豆瓣书影音档案，不依赖 TMDB 识别，失败自动重试。"
     plugin_icon = "Douban_A.png"
-    plugin_version = "1.7.0"
+    plugin_version = "1.7.1"
     plugin_author = "liclown2020"
     author_url = "https://github.com/liclown2020"
     plugin_config_prefix = "doubanarchive_"
@@ -622,7 +622,7 @@ class DoubanArchive(_PluginBase):
         - 豆瓣条目按媒体服务器刮削的豆瓣 ID 优先，取不到才搜索。
         """
         summary = {"libraries": 0, "scanned": 0, "watched": 0, "imported": 0,
-                   "skipped": 0, "failed": 0, "items": []}
+                   "skipped": 0, "failed": 0, "items": [], "reasons": []}
         if not self._enabled:
             logger.warn("插件未启用，无法扫描媒体库")
             return summary
@@ -631,6 +631,7 @@ class DoubanArchive(_PluginBase):
         if not client.has_login():
             logger.error("豆瓣 cookie 为空，无法导入")
             summary["failed"] = 1
+            summary["reasons"].append("豆瓣 cookie 为空")
             return summary
 
         selected = self._selected_libraries()
@@ -640,9 +641,11 @@ class DoubanArchive(_PluginBase):
             libraries = [lib for lib in libraries if lib["name"] in selected]
         if not libraries:
             logger.warn("未找到可扫描的媒体库")
+            summary["reasons"].append("未找到可扫描的媒体库")
             return summary
 
         summary["libraries"] = len(libraries)
+        summary["selected_libraries"] = [lib["name"] for lib in libraries]
         with self._lock:
             archive = dict(self.get_data(_KEY_ARCHIVE) or {})
         existing = set(archive.keys())
@@ -671,19 +674,17 @@ class DoubanArchive(_PluginBase):
                     key = self._archive_key(title, "TV", season)
                     if key in existing or key in updates:
                         summary["skipped"] += 1
+                        summary["reasons"].append(f"{title} 第{season}季：已在档案中")
                         continue
 
                     record = self._build_scan_record(series, season, episodes)
-                    if not record:
-                        summary["skipped"] += 1
-                        continue
-
                     douban_id = record["subject_id"]
                     if not douban_id:
-                        subject_name, found = self._search_subject(
-                            title, season, "TV")
+                        subject_name, found = self._search_subject(title, season, "TV")
                         if not found:
                             summary["skipped"] += 1
+                            summary["reasons"].append(
+                                f"{title} 第{season}季：未找到豆瓣条目")
                             continue
                         record["subject_id"] = douban_id
                         record["subject_name"] = subject_name
@@ -697,6 +698,8 @@ class DoubanArchive(_PluginBase):
                         logger.info(f"导入 {title} 第{season}季 为看过")
                     else:
                         summary["failed"] += 1
+                        summary["reasons"].append(
+                            f"{title} 第{season}季：写入豆瓣失败（id={douban_id}）")
 
         if updates:
             with self._lock:
