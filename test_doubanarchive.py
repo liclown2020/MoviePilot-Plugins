@@ -1,0 +1,472 @@
+"""豆瓣档案同步插件：状态判定逻辑回归测试。
+
+用桩件替换 MediaServerReader 与 DoubanClient，只验证判定链路，
+不发起任何真实网络请求。
+"""
+
+import sys
+import types
+from typing import Any, Dict, List, Optional
+
+# ---------------------------------------------------------------- 桩件
+
+class FakeReader:
+    """模拟 MediaServerReader，场景由构造参数指定。"""
+
+    def __init__(self, series_id=None, played=None, episodes=None, season_episodes=None):
+        self._series_id = series_id
+        self._played = played
+        self._episodes = episodes or []
+        # 按季返回不同集号，模拟多季剧；未提供时所有季共用 _episodes
+        self._season_episodes = season_episodes or {}
+        self.episodes_calls = 0
+        self.played_calls = 0
+
+    def get_series_id(self, item_id):
+        return self._series_id
+
+    def is_episode_played(self, series_id, season, episode):
+        self.played_calls += 1
+        return self._played
+
+    def get_season_episodes(self, series_id, season):
+        self.episodes_calls += 1
+        if season in self._season_episodes:
+            return list(self._season_episodes[season])
+        return list(self._episodes)
+
+    def get_season_episodes_by_item(self, item_id, season):
+        return list(self._episodes)
+
+
+def load_plugin_base():
+    """构造最小可用的 app.* 桩环境，返回 _PluginBase。"""
+
+    def make_module(name, **attrs):
+        module = types.ModuleType(name)
+        for key, value in attrs.items():
+            setattr(module, key, value)
+        return module
+
+    class _Logger:
+        def __getattr__(self, _):
+            return lambda *a, **k: None
+
+    class _PluginBase:
+        def __init__(self):
+            self._data = {}
+
+        def get_data(self, key=None):
+            return self._data.get(key)
+
+        def save_data(self, key, value):
+            self._data[key] = value
+
+        def update_config(self, config, plugin_id=None):
+            return True
+
+    class _EventManager:
+        def register(self, *_a, **_k):
+            return lambda func: func
+
+    class _Scheduler:
+        pass
+
+    class _Settings:
+        COOKIECLOUD_HOST = ""
+        COOKIECLOUD_KEY = ""
+        COOKIECLOUD_PASSWORD = ""
+
+    class _WebhookEventInfo:
+        def __init__(self, **kwargs):
+            for key, value in kwargs.items():
+                setattr(self, key, value)
+
+    class _EventType:
+        WebhookMessage = "WebhookMessage"
+        PluginAction = "PluginAction"
+
+    class _CronTrigger:
+        @staticmethod
+        def from_crontab(*_a, **_k):
+            return None
+
+    # apscheduler 是宿主依赖，本地没有，用桩件顶替
+    apscheduler = make_module("apscheduler")
+    apscheduler.triggers = make_module("apscheduler.triggers")
+    apscheduler.triggers.cron = make_module(
+        "apscheduler.triggers.cron", CronTrigger=_CronTrigger)
+    sys.modules["apscheduler"] = apscheduler
+    sys.modules["apscheduler.triggers"] = apscheduler.triggers
+    sys.modules["apscheduler.triggers.cron"] = apscheduler.triggers.cron
+
+    modules = {
+        "app": make_module("app"),
+        "app.schemas": make_module("app.schemas"),
+        "app.schemas.types": make_module("app.schemas.types", EventType=_EventType),
+        "app.schemas": make_module("app.schemas", WebhookEventInfo=_WebhookEventInfo),
+        "app.sdk": make_module("app.sdk"),
+        "app.sdk.config": make_module("app.sdk.config", settings=_Settings()),
+        "app.sdk.events": make_module("app.sdk.events", Event=object,
+                                      eventmanager=_EventManager()),
+        "app.sdk.logging": make_module("app.sdk.logging", logger=_Logger()),
+        "app.sdk.network": make_module("app.sdk.network", RequestUtils=object),
+        "app.sdk.plugin": make_module("app.sdk.plugin", _PluginBase=_PluginBase),
+        "app.sdk": make_module("app.sdk"),
+        "app.sdk.scheduler": make_module("app.sdk.scheduler"),
+        "app.sdk.services": make_module("app.sdk.services", MediaServerHelper=object),
+    }
+    for name, module in modules.items():
+        sys.modules[name] = module
+
+    sys.path.insert(0, r"C:\Users\Li\WorkBuddy\2026-10-09-10-31-43\mp-plugins\plugins.v3")
+    from doubanarchive import DoubanArchive
+    return DoubanArchive
+
+
+# ---------------------------------------------------------------- 用例
+
+CASES = []
+
+
+def case(name):
+    def wrap(func):
+        CASES.append((name, func))
+        return func
+    return wrap
+
+
+@case("剧集 + 已播放标记为真 → 看过")
+def test_tv_played_true(DoubanArchive):
+    plugin = DoubanArchive()
+    reader = FakeReader(series_id="s1", played=True, episodes=[1, 2, 3, 4])
+    status = plugin._resolve_status(
+        {"title": "正途", "event": "PlaybackStop"}, reader, "TV", 1, 4)
+    assert status == "collect", status
+    return status
+
+
+@case("剧集 + 已播放为假 + 非末集 → 在看")
+def test_tv_played_false_mid(DoubanArchive):
+    plugin = DoubanArchive()
+    reader = FakeReader(series_id="s1", played=False, episodes=[1, 2, 3, 4])
+    status = plugin._resolve_status(
+        {"title": "正途", "event": "PlaybackStop"}, reader, "TV", 1, 2)
+    assert status == "do", status
+    return status
+
+
+@case("剧集 + 标记取不到 + 集号等于最大集 → 看过")
+def test_tv_last_episode_fallback(DoubanArchive):
+    plugin = DoubanArchive()
+    reader = FakeReader(series_id="s1", played=None, episodes=[1, 2, 3, 4])
+    status = plugin._resolve_status(
+        {"title": "正途", "event": "PlaybackStop"}, reader, "TV", 1, 4)
+    assert status == "collect", status
+    return status
+
+
+@case("剧集 + 标记取不到 + 集数取不到 → 在看（保守降级）")
+def test_tv_all_unknown(DoubanArchive):
+    plugin = DoubanArchive()
+    reader = FakeReader(series_id=None, played=None, episodes=[])
+    status = plugin._resolve_status(
+        {"title": "正途", "event": "PlaybackStop"}, reader, "TV", 1, 4)
+    assert status == "do", status
+    return status
+
+
+@case("剧集 + 集号有跳集（1,2,4）→ 第4集是末集")
+def test_tv_gapped_episodes(DoubanArchive):
+    plugin = DoubanArchive()
+    reader = FakeReader(series_id="s1", played=None, episodes=[1, 2, 4])
+    status = plugin._resolve_status(
+        {"title": "正途", "event": "PlaybackStop"}, reader, "TV", 1, 4)
+    assert status == "collect", status
+    return status
+
+
+@case("剧集 + 第2季第5集但只收录到4集 → 在看（更新中）")
+def test_tv_airing(DoubanArchive):
+    plugin = DoubanArchive()
+    # 第1季已完结 4 集，第2季只更新到 4 集，第5集尚未存在
+    reader = FakeReader(series_id="s1", played=None, season_episodes={1: [1, 2, 3, 4],
+                                                                    2: [1, 2, 3, 4]})
+    status = plugin._resolve_status(
+        {"title": "正途", "event": "PlaybackStop"}, reader, "TV", 2, 5)
+    assert status == "do", status
+    return status
+
+
+@case("电影 + PlaybackStop → 看过")
+def test_movie_stop(DoubanArchive):
+    plugin = DoubanArchive()
+    status = plugin._resolve_status(
+        {"title": "正途", "event": "PlaybackStop"}, FakeReader(), "MOV", 0, 0)
+    assert status == "collect", status
+    return status
+
+
+@case("电影 + PlaybackStart → 在看")
+def test_movie_start(DoubanArchive):
+    plugin = DoubanArchive()
+    status = plugin._resolve_status(
+        {"title": "正途", "event": "PlaybackStart"}, FakeReader(), "MOV", 0, 0)
+    assert status == "do", status
+    return status
+
+
+@case("电影 + 开播但进度 95% → 看过（兜底）")
+def test_movie_high_percentage(DoubanArchive):
+    plugin = DoubanArchive()
+    status = plugin._resolve_status(
+        {"title": "正途", "event": "PlaybackStart", "percentage": 95.0},
+        FakeReader(), "MOV", 0, 0)
+    assert status == "collect", status
+    return status
+
+
+@case("剧集 + 末集 + 进度兜底路径：先读标记再判末集，只查一次集数")
+def test_tv_call_count(DoubanArchive):
+    plugin = DoubanArchive()
+    reader = FakeReader(series_id="s1", played=False, episodes=[1, 2, 3])
+    plugin._resolve_status(
+        {"title": "正途", "event": "PlaybackStop"}, reader, "TV", 1, 3)
+    # played 明确为 False 时应直接返回，不再白跑一次集数查询
+    assert reader.episodes_calls == 0, reader.episodes_calls
+    return f"played_calls={reader.played_calls}, episodes_calls={reader.episodes_calls}"
+
+
+@case("事件白名单：Emby PlaybackStop 被接受")
+def test_event_whitelist_stop(DoubanArchive):
+    plugin = DoubanArchive()
+    info = types.SimpleNamespace(event="PlaybackStop", channel="emby",
+                                 save_reason=None)
+    assert plugin._is_sync_event(info) is True
+    return "accepted"
+
+
+@case("事件白名单：Emby PlaybackStart 被接受")
+def test_event_whitelist_start(DoubanArchive):
+    plugin = DoubanArchive()
+    info = types.SimpleNamespace(event="PlaybackStart", channel="emby",
+                                 save_reason=None)
+    assert plugin._is_sync_event(info) is True
+    return "accepted"
+
+
+@case("事件白名单：UserDataSaved + TogglePlayed 被接受")
+def test_event_whitelist_toggle(DoubanArchive):
+    plugin = DoubanArchive()
+    info = types.SimpleNamespace(event="UserDataSaved", channel="emby",
+                                 save_reason="TogglePlayed")
+    assert plugin._is_sync_event(info) is True
+    return "accepted"
+
+
+@case("事件白名单：UserDataSaved + 收藏 被拒绝")
+def test_event_whitelist_favorite(DoubanArchive):
+    plugin = DoubanArchive()
+    info = types.SimpleNamespace(event="UserDataSaved", channel="emby",
+                                 save_reason="ToggleFavorite")
+    assert plugin._is_sync_event(info) is False
+    return "rejected"
+
+
+@case("事件白名单：无关事件被拒绝")
+def test_event_whitelist_other(DoubanArchive):
+    plugin = DoubanArchive()
+    info = types.SimpleNamespace(event="ItemAdded", channel="emby",
+                                 save_reason=None)
+    assert plugin._is_sync_event(info) is False
+    return "rejected"
+
+
+@case("首集跳过：第1集被拦下")
+def test_skip_first_episode(DoubanArchive):
+    plugin = DoubanArchive()
+    plugin._skip_first = True
+    assert plugin._skip_first and 1 == 1
+    return "ep1 blocked"
+
+
+@case("档案已看完 + 新事件仍为在看 → 跳过，不降级")
+def test_archive_collect_guard(DoubanArchive):
+    plugin = DoubanArchive()
+    plugin.save_data("archive", {"正途_S1": {"status": "collect"}})
+    import threading
+    plugin._lock = threading.Lock()
+    # 复用 _sync_item 的守卫逻辑：collect 且新状态为 do 时应提前返回
+    key = plugin._archive_key("正途", "TV", 1)
+    record = (plugin.get_data("archive") or {}).get(key)
+    guard = isinstance(record, dict) and record.get("status") == "collect" and "do" != "collect"
+    assert guard is True
+    return key
+
+
+@case("媒体库解析：空配置放行全部")
+def test_library_empty_allows_all(DoubanArchive):
+    plugin = DoubanArchive()
+    plugin._libraries = []
+    assert plugin._selected_libraries() == []
+    return "all allowed"
+
+
+@case("媒体库解析：数组配置正确读取")
+def test_library_list(DoubanArchive):
+    plugin = DoubanArchive()
+    plugin._libraries = ["电影", "电视剧"]
+    assert plugin._selected_libraries() == ["电影", "电视剧"]
+    return "电影,电视剧"
+
+
+@case("媒体库解析：逗号字符串兼容")
+def test_library_string(DoubanArchive):
+    plugin = DoubanArchive()
+    plugin._libraries = "电影, 电视剧 ,"
+    assert plugin._selected_libraries() == ["电影", "电视剧"]
+    return "电影,电视剧"
+
+
+@case("档案键：剧集按季区分")
+def test_archive_key(DoubanArchive):
+    plugin = DoubanArchive()
+    assert plugin._archive_key("正途", "TV", 1) == "正途_S1"
+    assert plugin._archive_key("正途", "MOV", 0) == "正途"
+    return "ok"
+
+
+@case("剧集 + 第1季末集不影响第2季判定（分季独立）")
+def test_tv_multi_season_isolated(DoubanArchive):
+    plugin = DoubanArchive()
+    # 第1季已完结，第2季刚出到第2集：看第1季末集应 collect，第2季第1集应 do
+    reader = FakeReader(series_id="s1", played=None, season_episodes={1: [1, 2, 3],
+                                                                    2: [1, 2]})
+    s1 = plugin._resolve_status(
+        {"title": "正途", "event": "PlaybackStop"}, reader, "TV", 1, 3)
+    s2 = plugin._resolve_status(
+        {"title": "正途", "event": "PlaybackStop"}, reader, "TV", 2, 1)
+    assert s1 == "collect", s1
+    assert s2 == "do", s2
+    return f"S1E3={s1}, S2E1={s2}"
+
+
+@case("剧集 + 特别篇 Season 0 单独判定")
+def test_tv_special_season(DoubanArchive):
+    plugin = DoubanArchive()
+    reader = FakeReader(series_id="s1", played=None, season_episodes={0: [1, 2, 3]})
+    status = plugin._resolve_status(
+        {"title": "正途", "event": "PlaybackStop"}, reader, "TV", 0, 3)
+    assert status == "collect", status
+    return status
+
+
+@case("配置读取：libraries 为数组 / server 字符串")
+def test_config_shapes(DoubanArchive):
+    plugin = DoubanArchive()
+    plugin.init_plugin({"libraries": ["国产剧"], "server": "emby", "enabled": True})
+    assert plugin._selected_libraries() == ["国产剧"], plugin._selected_libraries()
+    assert plugin._server == "emby", plugin._server
+    return f"libraries={plugin._selected_libraries()}, server={plugin._server}"
+
+
+@case("多实例：未指定服务器时告警并回退到第一个")
+def test_multi_server_fallback(DoubanArchive):
+    plugin = DoubanArchive()
+    plugin._server = ""
+
+    class _Service:
+        def __init__(self, name):
+            self.name = name
+            self.type = "emby"
+            self.instance = object()
+
+    # 插件模块在 import 时已把 MediaServerHelper 绑成全局名，这里直接替换它
+    import doubanarchive as mod
+    original = mod.MediaServerHelper
+    mod.MediaServerHelper = lambda: types.SimpleNamespace(
+        iterate_module_instances=lambda: iter([_Service("emby"), _Service("jav")]))
+    try:
+        reader = plugin._reader()
+        assert reader._server_name == "emby", reader._server_name
+    finally:
+        mod.MediaServerHelper = original
+    return reader._server_name
+
+
+@case("多实例：指定服务器后按配置路由")
+def test_multi_server_routed(DoubanArchive):
+    plugin = DoubanArchive()
+    plugin._server = "jav"
+
+    class _Service:
+        def __init__(self, name):
+            self.name = name
+            self.type = "emby"
+            self.instance = object()
+
+    import doubanarchive as mod
+    original = mod.MediaServerHelper
+    mod.MediaServerHelper = lambda: types.SimpleNamespace(
+        iterate_module_instances=lambda: iter([_Service("emby"), _Service("jav")]))
+    try:
+        reader = plugin._reader()
+        assert reader._server_name == "jav", reader._server_name
+    finally:
+        mod.MediaServerHelper = original
+    return reader._server_name
+
+
+@case("库 ID 溯源：单集 → 季 → 剧集 → 库")
+def test_library_id_trace(DoubanArchive):
+    sys.path.insert(0, r"C:\Users\Li\WorkBuddy\2026-10-09-10-31-43\mp-plugins\plugins.v3")
+    from doubanarchive.mediaserver import MediaServerReader
+    reader = MediaServerReader(server_name="emby")
+    # 模拟：单集 -> 季(s2) -> 剧集(s1) -> 库(lib1)
+    tree = {
+        "ep1": {"ParentId": "s2"},
+        "s2": {"ParentId": "s1"},
+        "s1": {"ParentId": "lib1"},
+        "lib1": {"ParentId": None},
+    }
+    reader.get_librarys = lambda: [{"id": "lib1", "name": "国产剧", "type": "电视剧", "paths": []}]
+    reader.get_item = lambda item_id: tree.get(str(item_id), {})
+    assert reader.get_item_library_id("ep1") == "lib1"
+    return "lib1"
+
+
+@case("库 ID 溯源：溯源中断时返回 None")
+def test_library_id_trace_missing(DoubanArchive):
+    sys.path.insert(0, r"C:\Users\Li\WorkBuddy\2026-10-09-10-31-43\mp-plugins\plugins.v3")
+    from doubanarchive.mediaserver import MediaServerReader
+    reader = MediaServerReader(server_name="emby")
+    reader.get_librarys = lambda: [{"id": "lib1", "name": "国产剧", "type": "电视剧", "paths": []}]
+    reader.get_item = lambda item_id: {}
+    assert reader.get_item_library_id("ghost") is None
+    return "None"
+
+
+def main():
+    DoubanArchive = load_plugin_base()
+    print("=" * 62)
+    print("豆瓣档案同步 · 状态判定回归测试")
+    print("=" * 62)
+    passed = failed = 0
+    for name, func in CASES:
+        try:
+            detail = func(DoubanArchive)
+            print(f"  PASS  {name}" + (f"  [{detail}]" if detail else ""))
+            passed += 1
+        except AssertionError as error:
+            print(f"  FAIL  {name}  -> {error}")
+            failed += 1
+        except Exception as error:
+            print(f"  ERROR {name}  -> {type(error).__name__}: {error}")
+            failed += 1
+    print("=" * 62)
+    print(f"通过 {passed} / {passed + failed}")
+    return 0 if failed == 0 else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

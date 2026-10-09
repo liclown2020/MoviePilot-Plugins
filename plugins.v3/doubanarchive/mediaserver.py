@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 from app.sdk.logging import logger
 from app.sdk.services import MediaServerHelper
@@ -15,8 +15,9 @@ class MediaServerReader:
     """
     按 webhook 事件定位媒体服务器实例，读取条目元信息。
 
-    读取能力包括：条目的 ProviderIds（取豆瓣 ID）、所属剧集 ID、某季已收录
-    集数、以及可用于前端展示的图片地址。读取失败统一返回空值，由调用方降级。
+    读取能力包括：条目的 ProviderIds（取豆瓣 ID）、真实集号列表（判定是否末集）、
+    单集已播放状态、所属媒体库，以及可用于前端展示的图片地址。
+    读取失败统一返回空值，由调用方降级。
     """
 
     def __init__(self, server_name: Optional[str] = None, timeout: int = 15) -> None:
@@ -45,7 +46,11 @@ class MediaServerReader:
         if cache_key in self._cache:
             return self._cache[cache_key]
 
-        response = self._get(instance, f"[HOST]emby/Users/[USER]/Items/{item_id}?fields=ProviderIds&api_key=[APIKEY]")
+        response = self._get(
+            instance,
+            f"[HOST]emby/Users/[USER]/Items/{item_id}"
+            f"?fields=ProviderIds,Path,ParentId&api_key=[APIKEY]",
+        )
         data = response if isinstance(response, dict) else {}
         self._cache[cache_key] = data
         return data
@@ -68,36 +73,176 @@ class MediaServerReader:
                 return douban_id
         return None
 
-    def get_season_total(self, item_id: str, season_no: int) -> Optional[int]:
+    def get_series_id(self, item_id: str) -> Optional[str]:
         """
-        读取某一季已收录的集数，用于判断是否看到本季最后一集。
-        取不到返回 None，由调用方决定降级行为。
+        解析条目所属剧集的 ID。
+        宿主的 webhook 对剧集事件已经把 item_id 置为 SeriesId，
+        这里仍做一次兜底判断，避免不同版本字段缺失时取不到。
         """
-        item = self.get_item(item_id)
-        series_id = str(item.get("SeriesId") or "")
-        if not series_id and item.get("Type") == "Series":
-            series_id = str(item.get("Id") or item_id)
-        if not series_id:
+        if not item_id:
             return None
+        item = self.get_item(item_id)
+        if not item:
+            # 条目读不到时，按宿主约定直接认为传入的就是剧集 ID
+            return str(item_id)
 
+        item_type = str(item.get("Type") or "")
+        if item_type == "Series":
+            return str(item.get("Id") or item_id)
+
+        series_id = item.get("SeriesId")
+        if series_id:
+            return str(series_id)
+
+        season_id = item.get("SeasonId") or item.get("ParentId")
+        if season_id and item_type == "Season":
+            season_item = self.get_item(str(season_id))
+            if season_item:
+                return str(season_item.get("SeriesId") or season_id)
+        return None
+
+    def get_season_episodes(self, series_id: str, season_no: int) -> List[int]:
+        """
+        读取某一季实际存在的集号列表（升序）。
+        走 Shows/Id/Episodes 逐集遍历，与宿主判断剧集存在性的口径一致，
+        不依赖 Season 元数据里的 ChildCount。
+        """
+        if not series_id:
+            return []
+        instance, server_type = self._locate()
+        if not instance:
+            return []
+
+        cache_key = (server_type, f"{series_id}-episodes-{season_no}")
+        cached = self._cache.get(cache_key)
+        if cached is not None:
+            return list(cached)
+
+        response = self._get(
+            instance,
+            f"[HOST]emby/Shows/{series_id}/Episodes?Season={season_no}"
+            f"&IsMissing=false&api_key=[APIKEY]",
+        )
+        episodes: Set[int] = set()
+        items = response.get("Items") if isinstance(response, dict) else None
+        for entry in items or []:
+            if not isinstance(entry, dict):
+                continue
+            index = self._to_int(entry.get("IndexNumber"))
+            parent = self._to_int(entry.get("ParentIndexNumber"))
+            if index is None or index <= 0:
+                continue
+            # 只认属于目标季的集，Season 参数失效时靠这个兜底
+            if parent is not None and season_no and parent != season_no:
+                continue
+            episodes.add(index)
+
+        result = sorted(episodes)
+        self._cache[cache_key] = result
+        return list(result)
+
+    def is_episode_played(self, series_id: str, season_no: int, episode_no: int) -> Optional[bool]:
+        """
+        读取指定单集在媒体服务器里的已播放标记。
+
+        这是「是否看完」最可靠的依据：Emby / Jellyfin 在播放结束或用户手动
+        标记为已播放时都会把 Played 置为 True，不依赖任何刮削元数据。
+        取不到返回 None，由调用方降级到按末集判定。
+        """
+        if not series_id or not episode_no:
+            return None
         instance, server_type = self._locate()
         if not instance:
             return None
 
-        cache_key = (server_type, f"{series_id}-season")
-        seasons = self._cache.get(cache_key)
-        if seasons is None:
-            response = self._get(instance, f"[HOST]emby/Shows/{series_id}/Seasons?api_key=[APIKEY]")
-            seasons = response.get("Items", []) if isinstance(response, dict) else []
-            self._cache[cache_key] = seasons
+        cache_key = (server_type, f"{series_id}-played-{season_no}-{episode_no}")
+        if cache_key in self._cache:
+            return self._cache[cache_key]
 
-        for season in seasons:
-            if not isinstance(season, dict):
+        response = self._get(
+            instance,
+            f"[HOST]emby/Shows/{series_id}/Episodes?Season={season_no}"
+            f"&IsMissing=false&api_key=[APIKEY]",
+        )
+        items = response.get("Items") if isinstance(response, dict) else None
+        played: Optional[bool] = None
+        for entry in items or []:
+            if not isinstance(entry, dict):
                 continue
-            if self._to_int(season.get("IndexNumber")) == season_no:
-                total = self._to_int(season.get("ChildCount"))
-                if total:
-                    return total
+            if self._to_int(entry.get("IndexNumber")) != episode_no:
+                continue
+            user_data = entry.get("UserData")
+            if isinstance(user_data, dict) and "Played" in user_data:
+                played = bool(user_data.get("Played"))
+            break
+
+        self._cache[cache_key] = played
+        return played
+
+    def get_librarys(self, server_name: Optional[str] = None) -> List[Dict[str, Any]]:
+        """
+        读取媒体服务器的全部媒体库，归一化成字典列表。
+        读取失败返回空列表，调用方据此关闭库过滤。
+        """
+        instance, _ = self._locate(server_name)
+        if not instance or not hasattr(instance, "get_librarys"):
+            return []
+
+        try:
+            libraries = instance.get_librarys()
+        except Exception as error:
+            logger.warn(f"读取媒体库列表失败：{error}")
+            return []
+
+        result: List[Dict[str, Any]] = []
+        for library in libraries or []:
+            name = self._pick(library, "name")
+            if not name:
+                continue
+            path = self._pick(library, "path")
+            result.append({
+                "id": str(self._pick(library, "id") or ""),
+                "name": str(name),
+                "type": str(self._pick(library, "type") or ""),
+                "paths": [str(item) for item in (path if isinstance(path, list) else [path]) if item],
+            })
+        return result
+
+    def get_item_path(self, item_id: str) -> Optional[str]:
+        """读取条目的物理路径，用于按媒体路径关键词过滤。"""
+        if not item_id:
+            return None
+        item = self.get_item(item_id)
+        path = item.get("Path")
+        if isinstance(path, str) and path:
+            return path
+        return None
+
+    def get_item_library_id(self, item_id: str) -> Optional[str]:
+        """
+        溯源条目所属的媒体库 ID。
+
+        宿主的 get_librarys() 走 Users/{user}/Views，该接口只返回 Id / Name /
+        CollectionType，不含 Path，因此无法用路径前缀反推归属。这里改为沿
+        ParentId 逐级向上，找到祖先中命中媒体库 ID 的那个即为所属库。
+        """
+        if not item_id:
+            return None
+        library_ids = {library["id"] for library in self.get_librarys() if library.get("id")}
+        if not library_ids:
+            return None
+
+        current = str(item_id)
+        # 剧集往上是 单集 → 季 → 剧集 → 库，最多回溯若干层足够覆盖
+        for _ in range(6):
+            item = self.get_item(current)
+            if not item:
+                return None
+            current = str(item.get("ParentId") or item.get("SeasonId") or "")
+            if not current:
+                return None
+            if current in library_ids:
+                return current
         return None
 
     def get_image_url(self, item_id: str) -> Optional[str]:
@@ -123,10 +268,17 @@ class MediaServerReader:
 
     # ---------------- 内部实现 ----------------
 
-    def _locate(self) -> Tuple[Optional[Any], str]:
-        """定位可用的媒体服务器实例，返回 (实例, 类型)。"""
-        if getattr(self, "_located", None) is not None:
+    def _locate(self, server_name: Optional[str] = None) -> Tuple[Optional[Any], str]:
+        """
+        定位可用的媒体服务器实例，返回 (实例, 类型)。
+        传入 server_name 时优先精确匹配，匹配不到再回退到第一个可用实例。
+        """
+        wanted = server_name or self._server_name
+        if getattr(self, "_located", None) is not None and not wanted:
             return (self._located, getattr(self, "_located_type", ""))
+        if getattr(self, "_located", None) is not None and wanted == getattr(self, "_located_name", ""):
+            return (self._located, getattr(self, "_located_type", ""))
+
         result: Tuple[Optional[Any], str] = (None, "")
         fallback: Tuple[Optional[Any], str] = (None, "")
         try:
@@ -134,7 +286,7 @@ class MediaServerReader:
                 server_type = (service.type or "").lower()
                 if server_type not in _SUPPORTED_TYPES or not service.instance:
                     continue
-                if self._server_name and service.name == self._server_name:
+                if wanted and service.name == wanted:
                     result = (service.instance, server_type)
                     break
                 if not fallback[0]:
@@ -143,9 +295,13 @@ class MediaServerReader:
             logger.debug(f"枚举媒体服务器实例失败：{error}")
             return (None, "")
 
-        self._located = result[0] if result[0] else fallback[0]
-        self._located_type = result[1] if result[0] else fallback[1]
-        return (self._located, self._located_type)
+        located = result[0] if result[0] else fallback[0]
+        located_type = result[1] if result[0] else fallback[1]
+        if located is not None:
+            self._located = located
+            self._located_type = located_type
+            self._located_name = wanted or ""
+        return (located, located_type)
 
     def _get(self, instance: Any, url: str) -> Optional[Dict[str, Any]]:
         """调用媒体服务器接口并解析 JSON，异常统一降级。"""
@@ -163,6 +319,13 @@ class MediaServerReader:
             logger.warn("媒体服务器响应解析失败")
             return None
         return data if isinstance(data, dict) else None
+
+    @staticmethod
+    def _pick(data: Any, key: str) -> Any:
+        """兼容 pydantic 模型与字典两种形态的取值。"""
+        if isinstance(data, dict):
+            return data.get(key)
+        return getattr(data, key, None)
 
     @staticmethod
     def _pick_douban(provider_ids: Optional[Dict[str, Any]]) -> Optional[str]:

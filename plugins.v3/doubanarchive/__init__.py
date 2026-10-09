@@ -6,7 +6,6 @@
 3. 网络请求全部放到宿主的延后任务里执行，不阻塞 webhook 事件线程；
 4. 同步失败的条目进入待处理队列，由定时服务重试。
 """
-
 from __future__ import annotations
 
 import re
@@ -23,6 +22,7 @@ from app.sdk.events import Event, eventmanager
 from app.sdk.logging import logger
 from app.sdk.network import RequestUtils
 from app.sdk.plugin import _PluginBase
+from app.sdk.services import MediaServerHelper
 from app.sdk import scheduler as scheduler_sdk
 
 try:  # 包内相对导入，兼容宿主重建实例的命名空间
@@ -32,10 +32,15 @@ except Exception:  # pragma: no cover - 极端加载路径兜底
     from app.plugins.doubanarchive.doubanclient import DoubanClient
     from app.plugins.doubanarchive.mediaserver import MediaServerReader
 
-# 播放开始事件
+# 播放开始事件：开播那一刻先记一条「在看」
 _PLAY_START = {"playback.start", "media.play", "PlaybackStart"}
-# 标记已播放事件
-_PLAYED = {"item.markplayed", "media.scrobble"}
+# 播放结束事件：播完 / 暂停 / 退出都会触发，是判定「看完」的关键时机
+_PLAY_STOP = {"playback.stop", "media.stop", "PlaybackStop", "PlaybackPause"}
+# 标记已播放事件：用户在媒体服务器里手动打勾
+_PLAYED = {"item.markplayed", "media.scrobble", "UserDataSaved"}
+# 电影播完即视为看完
+_MOVIE_TYPES = {"MOV", "MOVIE"}
+# 剧集集号解析失败时的兜底：豆瓣只区分「在看 / 看过」，不做百分比
 
 # 存档键，避免字符串散落各处
 _KEY_ARCHIVE = "archive"
@@ -58,7 +63,7 @@ class DoubanArchive(_PluginBase):
     plugin_name = "豆瓣档案同步"
     plugin_desc = "将在看、看完状态同步到豆瓣书影音档案，不依赖 TMDB 识别，失败自动重试。"
     plugin_icon = "Douban_A.png"
-    plugin_version = "1.2.0"
+    plugin_version = "1.3.0"
     plugin_author = "liclown2020"
     author_url = "https://github.com/liclown2020"
     plugin_config_prefix = "doubanarchive_"
@@ -80,6 +85,11 @@ class DoubanArchive(_PluginBase):
     _pc_num = 50
     _mobile_month = 2
     _mobile_num = 15
+    # 只同步这些媒体库，留空表示全部；多选组件存库名数组
+    _libraries: Any = ()
+    # 指定媒体服务器名称。宿主 webhook 不带服务器名，多实例时必须显式指定，
+    # 否则只能回退到第一个实例，可能读错服务器
+    _server = ""
     # 豆瓣图片有防盗链，仪表盘用后端取回的 data URI，这里做内存缓存
     _inline_image = True
     _inline_limit = 20
@@ -113,6 +123,8 @@ class DoubanArchive(_PluginBase):
         self._pc_num = self._to_int(config.get("pc_num"), 50, 1)
         self._mobile_month = self._to_int(config.get("mobile_month"), 2, 2)
         self._mobile_num = self._to_int(config.get("mobile_num"), 15, 1)
+        self._libraries = config.get("libraries") or []
+        self._server = str(config.get("server") or "").strip()
         self._inline_image = bool(config.get("inline_image", True))
         self._inline_limit = self._to_int(config.get("inline_limit"), 20, 1)
 
@@ -193,14 +205,21 @@ class DoubanArchive(_PluginBase):
         if not self._is_sync_event(info):
             logger.debug(f"事件 {info.event} 不是播放或标记已观看事件，忽略")
             return
-        if not self._is_allowed_path(info.item_path):
-            logger.debug(f"路径 {info.item_path} 命中排除关键词，忽略")
-            return
 
         title, media_type, season, episode = self._parse_media(info)
         if not title or not media_type:
             return
-        if media_type == "TV" and self._skip_first and episode < 2:
+
+        # 媒体库过滤放在解析之后，用 item_id 反查物理路径，比匹配事件原文更可靠
+        if not self._is_allowed_library(info):
+            logger.debug(f"{title} 不在所选媒体库内，忽略")
+            return
+        if not self._is_allowed_path(info.item_path):
+            logger.debug(f"路径 {info.item_path} 命中排除关键词，忽略")
+            return
+
+        # 首集跳过只影响「是否写入档案」，不能影响末集升级为看过
+        if media_type == "TV" and self._skip_first and episode == 1:
             logger.info(f"{title} 第 1 集不同步到豆瓣档案")
             return
 
@@ -212,6 +231,8 @@ class DoubanArchive(_PluginBase):
             "item_id": info.item_id or "",
             "server_name": info.server_name or "",
             "image": info.image_url or "",
+            "event": info.event or "",
+            "percentage": info.percentage,
         }
         job_id = f"sync_{media_type}_{re.sub(r'[^0-9A-Za-z]+', '', title)}_{season}_{episode}"
         self._schedule_once(job_id, lambda: self._sync_item(payload), f"同步 {title} 到豆瓣", 3)
@@ -237,11 +258,13 @@ class DoubanArchive(_PluginBase):
         with self._lock:
             archive = self.get_data(_KEY_ARCHIVE) or {}
             record = archive.get(key)
-            if isinstance(record, dict) and record.get("status") == "collect":
+            # 已经是「看过」就不再重复写入，但仍在看时允许升级为看过
+            if isinstance(record, dict) and record.get("status") == "collect" \
+                    and status != "collect":
                 logger.info(f"{self._display_title(title, season)} 已标记为看完，跳过")
                 return
 
-        reader = MediaServerReader(server_name=payload.get("server_name") or None)
+        reader = self._reader(payload.get("server_name"))
         subject_id = payload.get("subject_id") or reader.get_douban_id(payload.get("item_id") or "")
         subject_name = title
 
@@ -449,14 +472,67 @@ class DoubanArchive(_PluginBase):
                         media_type: str, season: int, episode: int) -> str:
         """
         判断应写入的状态：看完→collect，在看→do。
-        剧集依据媒体服务器该季已收录集数判断，取不到时按在看处理。
+
+        判定顺序：
+        1. 电影：播放结束事件直接算看过，开播事件先记在看；
+        2. 剧集：读媒体服务器里该集的真实已播放标记，为真即看过；
+        3. 已播放标记取不到时，回退到「是否本季末集」判断；
+        4. 仍取不到（正在更新的剧集、集数元数据缺失），保守记为在看。
         """
         if media_type != "TV":
+            return "collect" if self._is_finished_event(payload) else "do"
+
+        item_id = str(payload.get("item_id") or "")
+        series_id = reader.get_series_id(item_id)
+        episode_no = self._to_int(episode, 0, 0)
+
+        if series_id and episode_no:
+            played = reader.is_episode_played(series_id, season, episode_no)
+            if played is True:
+                return "collect"
+            if played is False:
+                # 媒体服务器明确记录了「未看完」，且不是末集，直接判定在看
+                return "do"
+
+        if series_id and episode_no and self._is_last_episode(reader, series_id, season, episode_no):
             return "collect"
-        total = reader.get_season_total(payload.get("item_id") or "", season)
-        if total and episode >= total:
-            return "collect"
+
+        logger.debug(
+            f"{payload.get('title')} S{season}E{episode_no} 未能确认为末集，"
+            f"按在看处理")
         return "do"
+
+    @staticmethod
+    def _is_last_episode(reader: MediaServerReader, series_id: str,
+                         season: int, episode: int) -> bool:
+        """
+        判断是否为该季最后一集。
+        集号列表来自 Shows/Id/Episodes 的真实结果，不依赖 Season 元数据。
+
+        必须要求该集确实存在于列表中：正在更新的剧集里，用户播放的集号
+        可能大于当前已收录的最大集号（如只更到 4 集却看了第 5 集），
+        这种情况属于「在看」而非「看完」，不能按大于等于处理。
+        """
+        episodes = reader.get_season_episodes(series_id, season)
+        if not episodes or episode not in episodes:
+            return False
+        return episode == max(episodes)
+
+    @staticmethod
+    def _is_finished_event(payload: Dict[str, Any]) -> bool:
+        """
+        判断事件是否代表「已看完」。
+        播完、暂停退出、标记已播放都算；开播不算。
+        """
+        event = str(payload.get("event") or "")
+        if event in _PLAY_STOP or event in _PLAYED:
+            return True
+        # 播放进度超过 90% 视为看完，兜底部分客户端不回传结束事件的情况
+        percentage = payload.get("percentage")
+        try:
+            return percentage is not None and float(percentage) >= 90
+        except (TypeError, ValueError):
+            return False
 
     def _load_cookie(self) -> str:
         """读取豆瓣 cookie：优先插件配置，其次 CookieCloud。"""
@@ -519,12 +595,20 @@ class DoubanArchive(_PluginBase):
         return (user_name or "") in allowed
 
     def _is_sync_event(self, info: WebhookEventInfo) -> bool:
-        """判断是否为需要处理的播放或标记已观看事件。"""
+        """
+        判断是否为需要处理的播放或标记已观看事件。
+        事件的 event 字段是宿主从媒体服务器原始报文透传过来的，
+        Emby 用 PlaybackStart / PlaybackStop / UserDataSaved，
+        Jellyfin 用 PlaybackStart / PlaybackStop 与 UserDataSaved(SaveReason)。
+        """
         event = info.event or ""
-        if event in _PLAY_START or event in _PLAYED:
+        if event in _PLAY_START or event in _PLAY_STOP or event in _PLAYED:
+            # UserDataSaved 也会被收藏等操作触发，用 SaveReason 收窄到手動标记已播放
+            if event == "UserDataSaved" and info.save_reason \
+                    and info.save_reason != "TogglePlayed":
+                return False
             return True
-        return (info.channel or "").lower() == "jellyfin" \
-            and event == "UserDataSaved" and info.save_reason == "TogglePlayed"
+        return False
 
     def _is_allowed_path(self, item_path: Optional[str]) -> bool:
         """按路径关键词过滤不需要同步的媒体。"""
@@ -535,6 +619,140 @@ class DoubanArchive(_PluginBase):
         if not path:
             return True
         return not any(keyword in path for keyword in keywords)
+
+    def _reader(self, event_server_name: Optional[str] = None) -> MediaServerReader:
+        """
+        构造媒体服务器读取器。
+
+        宿主的 webhook 事件不带服务器名（server_name 字段始终为空），
+        因此优先使用配置里指定的服务器；配置为空时，
+        若系统里只有一个 Emby/Jellyfin 就用它，多个则回退到第一个并告警。
+        """
+        name = (event_server_name or "").strip() or self._server
+        if not name:
+            try:
+                servers = [
+                    service for service in MediaServerHelper().iterate_module_instances()
+                    if (service.type or "").lower() in ("emby", "jellyfin") and service.instance
+                ]
+            except Exception:
+                servers = []
+            if len(servers) > 1:
+                names = "、".join(sorted(service.name for service in servers))
+                logger.warn(
+                    f"检测到多个媒体服务器（{names}），已回退到「{servers[0].name}」。"
+                    f"如需指定请在插件配置里填写媒体服务器名称。")
+            if servers:
+                name = servers[0].name
+        return MediaServerReader(server_name=name or None)
+
+    def _selected_libraries(self) -> List[str]:
+        """返回配置中选中的媒体库名列表，兼容数组与逗号分隔字符串两种存储。"""
+        raw = self._libraries
+        if isinstance(raw, (list, tuple, set)):
+            values = [str(item).strip() for item in raw]
+        else:
+            values = [item.strip() for item in str(raw or "").split(",")]
+        return [item for item in values if item]
+
+    def _server_items(self) -> List[Dict[str, Any]]:
+        """生成媒体服务器下拉选项，值为配置中的服务器名称。"""
+        items: List[Dict[str, Any]] = []
+        try:
+            for service in MediaServerHelper().iterate_module_instances():
+                if not service.instance or not service.name:
+                    continue
+                if (service.type or "").lower() not in ("emby", "jellyfin"):
+                    continue
+                items.append({"title": service.name, "value": service.name})
+        except Exception as error:
+            logger.debug(f"读取媒体服务器列表失败：{error}")
+        return items
+
+    def _library_items(self) -> List[Dict[str, Any]]:
+        """生成 VSelect 的选项，值为媒体库名，标题带上类型便于区分同名库。"""
+        items: List[Dict[str, Any]] = []
+        try:
+            libraries = self._available_libraries()
+        except Exception as error:
+            logger.debug(f"读取媒体库选项失败：{error}")
+            libraries = []
+        for library in libraries:
+            title = library["name"]
+            if library.get("type"):
+                title = f"{title}（{library['type']}）"
+            items.append({"title": title, "value": library["name"]})
+        return items
+
+    def _available_libraries(self) -> List[Dict[str, Any]]:
+        """
+        读取媒体服务器实际存在的媒体库，供配置页渲染下拉选项。
+        读取失败时返回空列表，此时配置页只提示手工填写。
+        """
+        try:
+            return self._reader().get_librarys()
+        except Exception as error:
+            logger.warn(f"获取媒体库列表失败：{error}")
+            return []
+
+    def _is_allowed_library(self, info: WebhookEventInfo) -> bool:
+        """
+        按媒体库过滤事件。
+        未选择任何库时放行；选择了库时判定条目归属的库是否在所选范围内。
+
+        判定方式：先沿 ParentId 溯源到媒体库 ID 再比对；取不到时回退到
+        物理路径前缀比对。两条路都取不到证据时保守放行，避免误杀正常条目。
+        """
+        selected = self._selected_libraries()
+        if not selected:
+            return True
+
+        try:
+            reader = self._reader(info.server_name)
+            libraries = reader.get_librarys()
+        except Exception as error:
+            logger.debug(f"按媒体库过滤时读取库列表失败：{error}")
+            return True
+
+        if not libraries:
+            return True
+
+        # 库名 → 库 ID，允许同名库（跨服务器）同时命中
+        selected_ids = {lib["id"] for lib in libraries
+                        if lib["name"] in selected and lib.get("id")}
+
+        item_id = str(info.item_id or "")
+        if item_id and selected_ids:
+            try:
+                library_id = reader.get_item_library_id(item_id)
+            except Exception as error:
+                logger.debug(f"溯源条目所属媒体库失败：{error}")
+                library_id = None
+            if library_id:
+                if library_id in selected_ids:
+                    return True
+                logger.debug(f"条目 {item_id} 属于未选中的媒体库，忽略")
+                return False
+
+        # 溯源失败时回退到路径前缀比对
+        item_path = info.item_path or ""
+        if not item_path and item_id:
+            try:
+                item_path = reader.get_item_path(item_id) or ""
+            except Exception:
+                item_path = ""
+        if not item_path:
+            return True
+
+        normalized = item_path.replace("\\", "/").rstrip("/").lower()
+        for library in libraries:
+            if library["name"] not in selected:
+                continue
+            for path in library["paths"]:
+                prefix = path.replace("\\", "/").rstrip("/").lower()
+                if prefix and (normalized == prefix or normalized.startswith(f"{prefix}/")):
+                    return True
+        return True
 
     def _parse_media(self, info: WebhookEventInfo) -> Tuple[str, str, int, int]:
         """
@@ -659,6 +877,51 @@ class DoubanArchive(_PluginBase):
                                 "props": {"cols": 12},
                                 "content": [
                                     {
+                                        "component": "VSelect",
+                                        "props": {
+                                            "model": "server",
+                                            "label": "媒体服务器",
+                                            "items": self._server_items(),
+                                            "placeholder": "只有一个媒体服务器时可留空",
+                                            "hint": "配置了多个媒体服务器时必须指定，否则可能读到另一台服务器的数据",
+                                        },
+                                    }
+                                ],
+                            },
+                        ],
+                    },
+                    {
+                        "component": "VRow",
+                        "content": [
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12},
+                                "content": [
+                                    {
+                                        "component": "VSelect",
+                                        "props": {
+                                            "model": "libraries",
+                                            "label": "同步的媒体库",
+                                            "multiple": True,
+                                            "chips": True,
+                                            "clearable": True,
+                                            "items": self._library_items(),
+                                            "placeholder": "不选表示全部媒体库",
+                                            "hint": "只同步选中媒体库的内容；读取不到媒体库时可手工填写库名，多个以逗号分隔",
+                                        },
+                                    }
+                                ],
+                            },
+                        ],
+                    },
+                    {
+                        "component": "VRow",
+                        "content": [
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12},
+                                "content": [
+                                    {
                                         "component": "VTextField",
                                         "props": {
                                             "model": "cookie",
@@ -761,6 +1024,7 @@ class DoubanArchive(_PluginBase):
                                             "type": "info",
                                             "variant": "tonal",
                                             "text": "本插件不依赖 TMDB 识别；豆瓣 ID 优先使用媒体服务器已刮削的标识。"
+                                                   "「看过」以媒体服务器的已播放标记为准，取不到时回退到「本季末集」判断。"
                                                    "同步失败会进入队列，每 30 分钟自动重试。"
                                                    "豆瓣图片有防盗链，关闭「内联豆瓣图片」后仪表盘可能显示不出封面。",
                                         },
@@ -787,6 +1051,8 @@ class DoubanArchive(_PluginBase):
             "pc_num": 50,
             "mobile_month": 2,
             "mobile_num": 15,
+            "libraries": [],
+            "server": "",
             "inline_image": True,
             "inline_limit": 20,
         }
