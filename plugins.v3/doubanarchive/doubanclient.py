@@ -280,35 +280,52 @@ class DoubanClient:
         return None, None
 
     def _search_by_web(self, title: str) -> Tuple[Optional[str], Optional[str]]:
-        """回退方案：解析豆瓣网页搜索结果。"""
-        url = f"https://www.douban.com/search?cat=1002&q={title}"
+        """
+        回退方案：解析豆瓣网页搜索结果。
+
+        www.douban.com/search 目前会跳转到登录页（未登录时返回的是登录页 HTML，
+        解析不出任何条目），因此先走 movie 域的搜索页，再退回 www 域。
+        """
+        for url in (
+            f"https://movie.douban.com/subject_search?search_text={title}&cat=1002",
+            f"https://www.douban.com/search?cat=1002&q={title}",
+        ):
+            subject_id = self._search_one_page(url)
+            if subject_id:
+                return title, subject_id
+        return None, None
+
+    def _search_one_page(self, url: str) -> Optional[str]:
+        """抓取单个搜索页并解析出首个条目 ID，失败返回 None。"""
         try:
-            response = RequestUtils(headers=self._build_base_headers(), timeout=self._timeout).get_res(url)
+            response = RequestUtils(headers=self._build_base_headers(),
+                                    timeout=self._timeout).get_res(url)
         except Exception as error:
-            logger.error(f"豆瓣网页搜索 {title} 失败：{error}")
-            return None, None
+            logger.debug(f"豆瓣搜索页请求失败：{error}")
+            return None
         if response is None or response.status_code != 200:
-            logger.error(f"豆瓣网页搜索 {title} 失败：无响应或状态码异常")
-            return None, None
+            logger.debug(f"豆瓣搜索页状态码异常：{getattr(response, 'status_code', None)}")
+            return None
+
+        text = response.text or ""
+        # 未登录会被跳到登录页，此时页面里不会有条目链接
+        if "login" in url or 'name="cookie"' in text or "登录" in text[:2000] and "/subject/" not in text:
+            logger.debug("豆瓣搜索页要求登录，放弃该通道")
+            return None
 
         try:
             from bs4 import BeautifulSoup
         except Exception:
-            logger.error("豆瓣网页搜索需要 BeautifulSoup，当前环境不可用")
-            return None, None
+            logger.debug("豆瓣网页搜索需要 BeautifulSoup，当前环境不可用")
+            return None
 
-        soup = BeautifulSoup(response.text, "html.parser")
-        for div in soup.select("div.result"):
-            link = div.find("a", href=True)
-            if not link or "subject" not in link["href"]:
-                continue
-            subject_id = ""
-            parts = [part for part in link["href"].rstrip("/").split("/") if part]
-            if len(parts) >= 2 and parts[-2] == "subject":
-                subject_id = parts[-1]
-            if subject_id.isdigit():
-                return link.get_text(strip=True) or title, subject_id
-        return None, None
+        soup = BeautifulSoup(text, "html.parser")
+        for link in soup.find_all("a", href=True):
+            href = link["href"]
+            parts = [item for item in href.rstrip("/").split("/") if item]
+            if len(parts) >= 2 and parts[-2] == "subject" and parts[-1].isdigit():
+                return parts[-1]
+        return None
 
     @staticmethod
     def _iter_items(result: Any):
