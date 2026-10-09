@@ -65,7 +65,7 @@ class DoubanArchive(_PluginBase):
     plugin_name = "豆瓣档案同步"
     plugin_desc = "将在看、看完状态同步到豆瓣书影音档案，不依赖 TMDB 识别，失败自动重试。"
     plugin_icon = "Douban_A.png"
-    plugin_version = "1.4.1"
+    plugin_version = "1.5.0"
     plugin_author = "liclown2020"
     author_url = "https://github.com/liclown2020"
     plugin_config_prefix = "doubanarchive_"
@@ -264,10 +264,11 @@ class DoubanArchive(_PluginBase):
                 entry["episodes_count"] = len(episodes)
                 entry["episodes"] = episodes[:60]
 
-                state = reader.get_season_play_state(series_id, season)
+                state = self._play_state_of_any_user(series_id, season)
                 entry["played_true"] = sum(1 for value in state.values() if value)
                 entry["played_false"] = sum(1 for value in state.values() if not value)
                 entry["played_total"] = len(state)
+                entry["users"] = self._target_users()
                 if not state:
                     entry["result"] = "未读取到任何集"
                 elif all(state.values()):
@@ -512,7 +513,9 @@ class DoubanArchive(_PluginBase):
                     continue
 
                 episodes = reader.get_season_episodes(series_id, season)
-                state = reader.get_season_play_state(series_id, season)
+                # 播放状态按用户隔离，这里汇总所有配置用户
+                state = self._play_state_of_any_user(series_id, season)
+                step["users"] = self._target_users()
                 step["episodes_count"] = len(episodes)
                 step["played_total"] = len(state)
                 step["played_true"] = sum(1 for value in state.values() if value)
@@ -727,7 +730,8 @@ class DoubanArchive(_PluginBase):
         episode_no = self._to_int(episode, 0, 0)
 
         if series_id and episode_no:
-            played = reader.is_episode_played(series_id, season, episode_no)
+            # 播放状态按用户隔离，汇总所有配置用户：任一看完即算看完
+            played = self._is_played_by_any_user(series_id, season, episode_no)
             if played is True:
                 return "collect"
             if played is False:
@@ -827,12 +831,59 @@ class DoubanArchive(_PluginBase):
         except Exception as error:
             logger.debug(f"移除延后任务失败：{error}")
 
+    def _target_users(self) -> List[str]:
+        """返回配置中允许触发同步的用户名列表。"""
+        return [item.strip() for item in self._users.split(",") if item.strip()]
+
     def _is_target_user(self, user_name: Optional[str]) -> bool:
         """判断事件用户是否在配置的媒体库用户名列表中。"""
-        allowed = [item.strip() for item in self._users.split(",") if item.strip()]
+        allowed = self._target_users()
         if not allowed:
             return False
         return (user_name or "") in allowed
+
+    def _play_state_of_any_user(self, series_id: str, season: int) -> Dict[int, bool]:
+        """
+        汇总所有配置用户的播放状态，同一集只要有人看完就算看完。
+
+        播放状态按用户隔离，多个账号各自维护进度。合并时取「或」，
+        避免因为某个账号没看而漏判成未看完。
+        未配置用户名时退回单用户查询（使用宿主默认账号）。
+        """
+        users = self._target_users()
+        if not users:
+            return self._reader().get_season_play_state(series_id, season)
+
+        merged: Dict[int, bool] = {}
+        for username in users:
+            try:
+                state = self._reader(username=username).get_season_play_state(series_id, season)
+            except Exception as error:
+                logger.debug(f"读取用户 {username} 的播放状态失败：{error}")
+                continue
+            for index, played in state.items():
+                merged[index] = merged.get(index, False) or played
+        return merged
+
+    def _is_played_by_any_user(self, series_id: str, season: int, episode: int) -> Optional[bool]:
+        """任一配置用户已看完该集即返回 True；全部明确未看完返回 False；查不到返回 None。"""
+        users = self._target_users()
+        if not users:
+            return self._reader().is_episode_played(series_id, season, episode)
+
+        seen = False
+        for username in users:
+            try:
+                played = self._reader(username=username).is_episode_played(series_id, season, episode)
+            except Exception as error:
+                logger.debug(f"读取用户 {username} 的单集播放状态失败：{error}")
+                continue
+            if played is None:
+                continue
+            if played:
+                return True
+            seen = True
+        return False if seen else None
 
     def _is_sync_event(self, info: WebhookEventInfo) -> bool:
         """
@@ -860,13 +911,17 @@ class DoubanArchive(_PluginBase):
             return True
         return not any(keyword in path for keyword in keywords)
 
-    def _reader(self, event_server_name: Optional[str] = None) -> MediaServerReader:
+    def _reader(self, event_server_name: Optional[str] = None,
+                username: Optional[str] = None) -> MediaServerReader:
         """
         构造媒体服务器读取器。
 
         宿主的 webhook 事件不带服务器名（server_name 字段始终为空），
         因此优先使用配置里指定的服务器；配置为空时，
         若系统里只有一个 Emby/Jellyfin 就用它，多个则回退到第一个并告警。
+
+        播放状态按用户隔离，username 决定查询哪个账号的观看记录；
+        为空时读取器会退回宿主默认（管理员），可能读不到真实进度。
         """
         name = (event_server_name or "").strip() or self._server
         if not name:
@@ -884,7 +939,7 @@ class DoubanArchive(_PluginBase):
                     f"如需指定请在插件配置里填写媒体服务器名称。")
             if servers:
                 name = servers[0].name
-        return MediaServerReader(server_name=name or None)
+        return MediaServerReader(server_name=name or None, username=username or None)
 
     def _selected_libraries(self) -> List[str]:
         """返回配置中选中的媒体库名列表，兼容数组与逗号分隔字符串两种存储。"""
