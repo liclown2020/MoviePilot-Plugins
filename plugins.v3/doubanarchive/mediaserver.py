@@ -301,14 +301,19 @@ class MediaServerReader:
     def _user_scope_url(self, instance: Any, path: str) -> str:
         """
         拼接带用户维度的查询地址。
-        能解析到 userId 时用它，确保读到的播放状态属于真实看剧账号。
+
+        path 可能已带查询串（形如 ".../Episodes?Season=1&IsMissing=false"），
+        因此这里用 & 追加参数，不能再用 ?，否则会产生两个问号导致后续参数全部失效。
         """
         user_id = self._resolve_user_id(instance)
         api_key = getattr(instance, "_apikey", "")
         host = getattr(instance, "_host", "") or ""
-        base = f"{host.rstrip('/')}{path}"
-        params = f"?userId={user_id}" if user_id else ""
-        return f"{base}{params}&api_key={api_key}"
+        separator = "&" if "?" in path else "?"
+        extra = f"userId={user_id}" if user_id else ""
+        if api_key:
+            extra = f"{extra}&api_key={api_key}" if extra else f"api_key={api_key}"
+        return f"{host.rstrip('/')}{path}{separator}{extra}" if extra \
+            else f"{host.rstrip('/')}{path}"
 
     def get_season_play_state(self, series_id: str, season_no: int) -> Dict[int, bool]:
         """
