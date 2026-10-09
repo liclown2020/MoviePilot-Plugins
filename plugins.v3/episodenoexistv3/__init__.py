@@ -105,7 +105,9 @@ class TvNoExistInfo(BaseModel):
     """电视剧媒体信息。"""
 
     title: Optional[str] = "未知"
-    year: Optional[str] = "未知"
+    # 年份：媒体服务器可能给 int（V3 的 MediaServerItem.year 是 Union[str, int]），
+    # 这里必须兼容两种类型，否则 pydantic v2 会因不做隐式转换而抛ValidationError。
+    year: Optional[int | str] = "未知"
     path: Optional[str] = "未知"
 
     # 媒体来源（V3 起不再是单一 tmdbid）
@@ -115,7 +117,7 @@ class TvNoExistInfo(BaseModel):
 
     # 海报地址
     poster_path: Optional[str] = "/assets/no-image-CweBJ8Ee.jpeg"
-    # 评分
+    # 评分：媒体服务器给 float，识别失败时保持默认值
     vote_average: Optional[float | str] = "未知"
     # 最后发行日期
     last_air_date: Optional[str] = "未知"
@@ -142,7 +144,7 @@ class EpisodeNoExistV3(_PluginBase):
     # 插件图标
     plugin_icon = "episodenoexist.png"
     # 插件版本
-    plugin_version = "1.0.1"
+    plugin_version = "1.0.2"
     # 插件作者
     plugin_author = "boeto / liclown2020"
     # 作者主页
@@ -216,12 +218,21 @@ class EpisodeNoExistV3(_PluginBase):
             else:
                 self._whitelist_librarys = []
 
-            _whitelist_media_servers = config.get("whitelist_media_servers", "")
-            if _whitelist_media_servers and isinstance(_whitelist_media_servers, str):
+            # 媒体服务器白名单：VSelect multiple 的值是数组，必须原样保存。
+            # 若存成逗号拼接的字符串，前端回显时拿不到数组，VSelect 会渲染成空框。
+            # 这里同时兼容旧版本存下的字符串格式。
+            _whitelist_media_servers = config.get("whitelist_media_servers") or []
+            if isinstance(_whitelist_media_servers, str):
                 self._whitelist_media_servers = [
                     item.strip()
                     for item in _whitelist_media_servers.split(",")
                     if item.strip()
+                ]
+            elif isinstance(_whitelist_media_servers, (list, tuple)):
+                self._whitelist_media_servers = [
+                    str(item).strip()
+                    for item in _whitelist_media_servers
+                    if str(item).strip()
                 ]
             else:
                 self._whitelist_media_servers = []
@@ -649,11 +660,13 @@ class EpisodeNoExistV3(_PluginBase):
             logger.debug(f"获取到媒体库【{item_title}】季集信息:{seasoninfo}")
 
         # 插入数据
+        raw_year = self.__item_attr(item, "year")
         item_dict: Dict[str, Any] = {
             "title": self.__item_attr(item, "title"),
             "original_title": self.__item_attr(item, "original_title"),
-            "year": self.__item_attr(item, "year"),
-            "path": self.__item_attr(item, "path"),
+            # 年份可能是 int / None，统一成 str，后续拼接与展示都不会出错
+            "year": "" if raw_year is None else str(raw_year),
+            "path": self.__item_attr(item, "path") or "",
             "media_source": str(media_source) if media_source else None,
             "media_id": str(media_id) if media_id else None,
             "tmdbid": int(media_id)
@@ -753,10 +766,14 @@ class EpisodeNoExistV3(_PluginBase):
 
         title = item_dict.get("title") or item_dict.get("original_title") or "未知标题"
 
+        # 年份归一化：媒体服务器给 int，None 时兜成空串，避免页面显示 "None"
+        raw_year = item_dict.get("year")
+        year: str = "" if raw_year is None else str(raw_year)
+
         tv_no_exist_info = TvNoExistInfo(
             title=title,
-            year=item_dict.get("year", ""),
-            path=item_dict.get("path", ""),
+            year=year,
+            path=item_dict.get("path") or "",
         )
 
         media_source: str | None = item_dict.get("media_source")
@@ -1048,9 +1065,7 @@ class EpisodeNoExistV3(_PluginBase):
             "only_exist_season": self._only_exist_season,
             "save_path_replaces": "\n".join(map(str, self._save_path_replaces)),
             "whitelist_librarys": ",".join(map(str, self._whitelist_librarys)),
-            "whitelist_media_servers": ",".join(
-                map(str, self._whitelist_media_servers)
-            ),
+            "whitelist_media_servers": list(self._whitelist_media_servers),
         }
         logger.info(f"更新配置 {__config}")
         self.update_config(__config)
@@ -1586,18 +1601,36 @@ class EpisodeNoExistV3(_PluginBase):
         }
 
     def __mediaserver_options(self) -> List[Dict[str, Any]]:
-        """给配置表单用的媒体服务器候选项，取不到时返回空列表由用户手填。"""
+        """
+        给配置表单用的媒体服务器候选项。
+
+        取不到实例时也把「已保存过的值」补进候选项，
+        否则已选中的值不在items 里，VSelect 会渲染成空框，
+        表现为「选完再打开，框里什么都没有」。
+        """
         options: List[Dict[str, Any]] = []
+        names: List[str] = []
         try:
             configs = MediaServerHelper().get_configs() or {}
         except Exception as err:
             logger.debug(f"获取媒体服务器配置失败：{err}")
-            return options
+            configs = {}
         for config in configs.values():
-            name = getattr(config, "name", None)
+            # 兼容 pydantic 模型与 dict 两种形态
+            name = (
+                config.get("name")
+                if isinstance(config, dict)
+                else getattr(config, "name", None)
+            )
             if name:
-                options.append({"title": str(name), "value": str(name)})
-        return options
+                names.append(str(name))
+
+        # 已保存的值即使不在当前配置里，也要出现在候选项中，避免回显丢失
+        for saved in self._whitelist_media_servers or []:
+            if str(saved) not in names:
+                names.append(str(saved))
+
+        return [{"title": name, "value": name} for name in names]
 
     def __get_action_buttons_content(self, unique: str | None, status: str):
         if not unique:
