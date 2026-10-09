@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from typing import Any, Dict, List, Optional, Set, Tuple
 from urllib.parse import quote
 
@@ -219,11 +220,50 @@ class MediaServerReader:
             })
         return result
 
+    @staticmethod
+    def build_title_candidates(title: str, season: int = 0) -> List[str]:
+        """
+        生成标题候选，按「越可能命中 Emby 原名」的顺序排列。
+
+        档案里的标题可能来自事件拼接，与媒体服务器里的剧集原名不一致，
+        例如档案存「小猪佩奇 迷你剧 第二季 第二季」，
+        而 Emby 里实际叫「小猪佩奇迷你剧」。逐级放宽直到能匹配上。
+        """
+        base = re.sub(r"\s+", " ", str(title or "")).strip()
+        if not base:
+            return []
+
+        # 数字需覆盖阿拉伯数字与中文数字（第二季 / 第2季）。
+        # 必须用非捕获分组包裹，否则 "|" 的优先级会让后半段脱离整体，
+        # 导致拼接出的正则分支错乱、剥离失败。
+        number = r"(?:\d+|[一二三四五六七八九十百零〇两])"
+        # 去掉各种季数后缀：第N季 / 第N部 / Season N / S N
+        pattern = (r"\s*第\s*" + number + r"\s*[季部集]\s*"
+                   r"|\s*Season\s*" + number + r"\s*"
+                   r"|\s*S" + number + r"\s*")
+        stripped = re.sub(pattern, " ", base, flags=re.IGNORECASE)
+        stripped = re.sub(r"\s+", " ", stripped).strip()
+
+        # 去掉末尾孤立的数字（如「xxx 5」）
+        no_tail = re.sub(r"\s+" + number + r"\s*$", "", stripped).strip()
+
+        # 中文剧名里的空格在 Emby 里常被去掉（如「小猪佩奇 迷你剧」→「小猪佩奇迷你剧」）
+        compact = re.sub(r"\s+", "", base)
+        compact_stripped = re.sub(r"\s+", "", stripped)
+
+        candidates: List[str] = [base]
+        for extra in (stripped, compact, no_tail, compact_stripped):
+            if extra and extra not in candidates:
+                candidates.append(extra)
+        return candidates
+
     def search_series(self, title: str, season: int = 0) -> Optional[str]:
         """
         按标题搜索剧集条目，返回剧集 ID。
         用于重扫历史档案：档案里只有标题和豆瓣 ID，需要重新定位媒体服务器条目。
-        精确匹配优先，找不到再取第一条完全同名的结果。
+
+        先用原始标题精确匹配；匹配不到时依次用标题候选重试，
+        以适应档案标题与 Emby 原名不一致的情况。
         """
         if not title:
             return None
@@ -231,7 +271,30 @@ class MediaServerReader:
         if not instance:
             return None
 
-        cache_key = (server_type, f"search-{title}-{season}")
+        result = self._search_by_title(instance, title, exact_only=True)
+        if result:
+            return result
+
+        # 候选里可能只有原标题自身（如「征途」无季数后缀），
+        # 此时也要再试一次放宽匹配，否则精确匹配失败就没有任何回退机会。
+        for candidate in self.build_title_candidates(title, season):
+            if candidate == title:
+                continue
+            result = self._search_by_title(instance, candidate, exact_only=False)
+            if result:
+                logger.info(f"标题「{title}」按候选「{candidate}」匹配到剧集条目")
+                return result
+
+        # 放宽同一标题再试一次，覆盖「结果集非空但名称不完全相同」的情况
+        return self._search_by_title(instance, title, exact_only=False)
+
+    def _search_by_title(self, instance: Any, title: str,
+                         exact_only: bool) -> Optional[str]:
+        """
+        用单个标题查询剧集条目。
+        exact_only 为真时只接受名称完全相同的结果，否则接受首条非空结果。
+        """
+        cache_key = ("search", f"{title}-{int(exact_only)}")
         if cache_key in self._cache:
             return self._cache[cache_key]
 
@@ -241,7 +304,8 @@ class MediaServerReader:
             f"&IncludeItemTypes=Series&Recursive=true&api_key=[APIKEY]",
         )
         items = response.get("Items") if isinstance(response, dict) else None
-        fallback: Optional[str] = None
+        found: Optional[str] = None
+        normalized = re.sub(r"\s+", "", str(title)).strip()
         for entry in items or []:
             if not isinstance(entry, dict):
                 continue
@@ -249,15 +313,16 @@ class MediaServerReader:
             if not item_id:
                 continue
             name = str(entry.get("Name") or "").strip()
-            if name == title.strip():
-                self._cache[cache_key] = item_id
-                return item_id
-            if not fallback and name:
-                fallback = item_id
+            if not name:
+                continue
+            if name == str(title).strip() or re.sub(r"\s+", "", name) == normalized:
+                found = item_id
+                break
+            if not exact_only and not found:
+                found = item_id
 
-        result = fallback
-        self._cache[cache_key] = result
-        return result
+        self._cache[cache_key] = found
+        return found
 
     def _resolve_user_id(self, instance: Any) -> Optional[str]:
         """
