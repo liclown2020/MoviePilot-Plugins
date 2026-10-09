@@ -14,5 +14,19 @@
       "v1.1.0": "更名为「豆瓣档案同步」，修复仪表盘时间线与缺封面问题。",
       "v1.0.0": "首个版本：事件延后处理、优先使用媒体库刮削的豆瓣ID、frodo搜索、失败队列重试。"
     }
+  },
+  "EpisodeNoExistV3": {
+    "name": "缺失集数订阅V3版",
+    "description": "定时比对媒体库实际集数与 TMDB 已播集数，找出缺失集数并自动补订阅；支持媒体服务器/媒体库白名单、下载路径替换、定时执行与手动补订阅。",
+    "labels": "媒体库,订阅,缺失集数,剧集",
+    "version": "1.0.0",
+    "icon": "episodenoexist.png",
+    "author": "boeto / liclown2020",
+    "level": 1,
+    "release": true,
+    "system_version": ">=3.0.0",
+    "history": {
+      "v1.0.0": "基于 boeto 的「缺失集数订阅」0.0.8 适配 MoviePilot V3：导入迁移到 app.sdk（config/logging/plugin/services）与 app.plugins；媒体身份由 tmdbid 改为 media_source + media_id 成对传递，订阅去重改用 V3 的 subscribeoper.exists(media_source, media_id, season) 位置参数；媒体服务器枚举改用 MediaServerHelper，替代已失效的 settings.MEDIASERVER；API_TOKEN 改走运行时设置；pydantic v2 下 .dict() 改为 .model_dump()；媒体详情页链接改用 mediaid 身份格式；修复下载路径替换在非 POSIX 宿主上取错父目录的问题；豆瓣等非 TMDB 来源因无季集数据不再误判缺失。"
+    }
   }
 }
