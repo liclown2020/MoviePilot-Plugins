@@ -1,17 +1,19 @@
 # MoviePilot 插件库
 
-面向 MoviePilot V3（`system_version >= 3.0.0`）的第三方插件。
+面向 MoviePilot V3（`system_version >= 3.0.0`）的第三方插件。两个插件各自独立，无依赖关系。
 
-| 插件 | 类名 / 目录 | 版本 | 说明 |
-| --- | --- | --- | --- |
-| 豆瓣档案同步 | `DoubanArchive` / `plugins.v3/doubanarchive` | 1.6.0 | 把 Emby / Jellyfin 的播放进度同步到豆瓣「书影音档案」 |
-| 缺失集数订阅V3版 | `EpisodeNoExistV3` / `plugins.v3/episodenoexistv3` | 1.0.0 | 比对媒体库实际集数与 TMDB 已播集数，自动补订阅缺失集数 |
+| 插件 | 类名 / 目录 | 版本 | 作者 | 来源 |
+| --- | --- | --- | --- | --- |
+| 豆瓣档案同步 | `DoubanArchive` / `plugins.v3/doubanarchive` | 1.6.0 | liclown2020 | 本仓库原创 |
+| 缺失集数订阅V3版 | `EpisodeNoExistV3` / `plugins.v3/episodenoexistv3` | 1.0.0 | boeto / liclown2020 | 改编自 [boeto/MoviePilot-Plugins](https://github.com/boeto/MoviePilot-Plugins) 的「缺失集数订阅」0.0.8 |
 
 ---
 
 # 豆瓣档案同步（DoubanArchive）
 
 把 Emby / Jellyfin 的播放进度同步到豆瓣「书影音档案」。看完自动标记「看过」。
+
+作者：liclown2020（本仓库原创）
 
 ## 特点
 
@@ -73,10 +75,10 @@
 
 # 缺失集数订阅V3版（EpisodeNoExistV3）
 
-定时比对媒体库里**实际存在的集数**与 **TMDB 已播出的集数**，找出缺集并自动补订阅。
+定时比对媒体库里**实际存在的集数**与**TMDB 已播出的集数**，找出缺集并自动补订阅。
 
 原作者：[boeto/MoviePilot-Plugins](https://github.com/boeto/MoviePilot-Plugins) 的「缺失集数订阅」0.0.8。
-本仓库的版本针对 MoviePilot V3 重做适配，功能与原插件一致。
+本版本由 liclown2020 适配 MoviePilot V3 后收录，与本仓库的豆瓣档案同步插件无关联。
 
 ## 它解决什么问题
 
