@@ -63,7 +63,7 @@ class DoubanArchive(_PluginBase):
     plugin_name = "豆瓣档案同步"
     plugin_desc = "将在看、看完状态同步到豆瓣书影音档案，不依赖 TMDB 识别，失败自动重试。"
     plugin_icon = "Douban_A.png"
-    plugin_version = "1.3.0"
+    plugin_version = "1.4.0"
     plugin_author = "liclown2020"
     author_url = "https://github.com/liclown2020"
     plugin_config_prefix = "doubanarchive_"
@@ -89,8 +89,7 @@ class DoubanArchive(_PluginBase):
     _libraries: Any = ()
     # 指定媒体服务器名称。宿主 webhook 不带服务器名，多实例时必须显式指定，
     # 否则只能回退到第一个实例，可能读错服务器
-    _server = ""
-    # 豆瓣图片有防盗链，仪表盘用后端取回的 data URI，这里做内存缓存
+    _server = ""    # 豆瓣图片有防盗链，仪表盘用后端取回的 data URI，这里做内存缓存
     _inline_image = True
     _inline_limit = 20
 
@@ -134,6 +133,12 @@ class DoubanArchive(_PluginBase):
             config["onlyonce"] = False
             self.update_config(config)
 
+        if config.get("rescan"):
+            # 勾选重扫档案：按媒体服务器真实播放状态校正历史条目
+            self._schedule_once("rescan_archive_once", self.rescan_archive, "重扫豆瓣档案", 3)
+            config["rescan"] = False
+            self.update_config(config)
+
         if self._enabled:
             logger.info("豆瓣档案同步插件已启用")
         else:
@@ -145,7 +150,7 @@ class DoubanArchive(_PluginBase):
 
     @staticmethod
     def get_command() -> List[Dict[str, Any]]:
-        """注册重试失败队列的远程命令。"""
+        """注册重试失败队列与重扫档案的远程命令。"""
         return [
             {
                 "cmd": "/douban_retry",
@@ -153,7 +158,14 @@ class DoubanArchive(_PluginBase):
                 "desc": "重试豆瓣同步失败队列",
                 "category": "插件命令",
                 "data": {"action": "douban_retry"},
-            }
+            },
+            {
+                "cmd": "/douban_rescan",
+                "event": EventType.PluginAction,
+                "desc": "重扫档案，按媒体服务器播放状态校正",
+                "category": "插件命令",
+                "data": {"action": "douban_rescan"},
+            },
         ]
 
     def get_service(self) -> List[Dict[str, Any]]:
@@ -171,7 +183,7 @@ class DoubanArchive(_PluginBase):
         ]
 
     def get_api(self) -> List[Dict[str, Any]]:
-        """注册档案查询接口。"""
+        """注册档案查询与重扫接口。"""
         return [
             {
                 "path": "/archive",
@@ -179,8 +191,23 @@ class DoubanArchive(_PluginBase):
                 "methods": ["GET"],
                 "auth": "bear",
                 "summary": "查询豆瓣同步档案",
-            }
+            },
+            {
+                "path": "/rescan",
+                "endpoint": self.api_rescan,
+                "methods": ["POST"],
+                "auth": "bear",
+                "summary": "重扫档案并校正状态",
+            },
         ]
+
+    def api_rescan(self) -> Dict[str, Any]:
+        """
+        重扫接口的实际处理函数。
+        扫描涉及多次外部请求，放到延后任务执行，接口立即返回避免请求超时。
+        """
+        self._schedule_once("rescan_archive_once", self.rescan_archive, "重扫豆瓣档案", 3)
+        return {"scheduled": True, "message": "重扫任务已提交，完成后查看 MP 日志"}
 
     def stop_service(self) -> None:
         """停止时取消未执行的延后任务并关闭状态。"""
@@ -241,9 +268,11 @@ class DoubanArchive(_PluginBase):
     def handle_command(self, event: Event) -> None:
         """处理属于本插件的远程命令。"""
         data = getattr(event, "event_data", None) or {}
-        if data.get("action") != "douban_retry":
-            return
-        self.retry_pending()
+        action = data.get("action")
+        if action == "douban_retry":
+            self.retry_pending()
+        elif action == "douban_rescan":
+            self.rescan_archive()
 
     # ---------------- 同步主流程 ----------------
 
@@ -340,6 +369,103 @@ class DoubanArchive(_PluginBase):
                 self._move_pending_to_archive(key, record)
             else:
                 logger.warn(f"{display} 重试仍然失败")
+
+    def rescan_archive(self) -> Dict[str, Any]:
+        """
+        重扫历史档案，按媒体服务器的真实播放状态校正豆瓣状态。
+
+        背景：v1.3.0 之前插件只认开播事件，历史条目的状态普遍停留在「在看」，
+        即使早已看完（如征途 S1E28 共 28 集）。本方法按条目在媒体服务器里的
+        已播放标记重新判定，把看完的补标为「看过」。
+
+        安全约束：
+        - 只升级为「看过」，不把已是「看过」的降级，避免误伤；
+        - 电影不做批量重扫（没有集号概念，直接看事件更准）；
+        - 媒体服务器查不到的条目原样保留，不猜测。
+        """
+        summary = {"total": 0, "upgraded": 0, "skipped": 0, "failed": 0, "details": []}
+        if not self._enabled:
+            logger.warn("插件未启用，无法重扫档案")
+            return summary
+
+        with self._lock:
+            archive = dict(self.get_data(_KEY_ARCHIVE) or {})
+        if not archive:
+            logger.info("档案为空，无需重扫")
+            return summary
+
+        client = DoubanClient(cookie=self._load_cookie())
+        if not client.has_login():
+            logger.error("豆瓣 cookie 为空，无法重扫档案")
+            summary["failed"] = len(archive)
+            return summary
+
+        reader = self._reader()
+        summary["total"] = len(archive)
+        logger.info(f"开始重扫豆瓣档案，共 {summary['total']} 条")
+
+        updates: Dict[str, Dict[str, Any]] = {}
+        for key, record in archive.items():
+            if not isinstance(record, dict):
+                continue
+            if record.get("status") == "collect":
+                summary["skipped"] += 1
+                continue
+            # 电影没有集号概念，不参与重扫
+            if not str(record.get("type") or "").startswith("电视剧"):
+                summary["skipped"] += 1
+                continue
+
+            title = str(record.get("subject_name") or record.get("title") or key)
+            season = self._to_int(record.get("season"), 0, 0)
+            subject_id = str(record.get("subject_id") or "")
+            if not subject_id:
+                summary["skipped"] += 1
+                continue
+
+            try:
+                series_id = reader.search_series(title, season)
+                if not series_id:
+                    logger.warn(f"{title} 在媒体服务器中未找到对应剧集，跳过")
+                    summary["skipped"] += 1
+                    continue
+                state = reader.get_season_play_state(series_id, season)
+                if not state:
+                    logger.warn(f"{title} 第{season}季未读取到任何集，跳过")
+                    summary["skipped"] += 1
+                    continue
+                # 整季全部已播放才算看完
+                if not all(state.values()):
+                    summary["skipped"] += 1
+                    continue
+            except Exception as error:
+                logger.warn(f"重扫 {title} 读取播放状态失败：{error}")
+                summary["failed"] += 1
+                continue
+
+            if client.set_status(subject_id=subject_id, status="collect", private=self._private):
+                logger.info(f"{title} 第{season}季已看完，重扫后标记为看过")
+                updates[key] = record
+                summary["upgraded"] += 1
+                summary["details"].append(title)
+            else:
+                logger.warn(f"{title} 重扫后写入豆瓣失败")
+                summary["failed"] += 1
+
+        if updates:
+            with self._lock:
+                current = dict(self.get_data(_KEY_ARCHIVE) or {})
+                for key in updates:
+                    if key not in current:
+                        continue
+                    current[key]["status"] = "collect"
+                    current[key]["timestamp"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                self.save_data(_KEY_ARCHIVE, current)
+            logger.info(f"重扫完成：{summary['upgraded']} 条升级为看过")
+        else:
+            logger.info("重扫完成：没有需要升级的条目")
+
+        return summary
 
     # ---------------- 数据读写 ----------------
 
@@ -950,6 +1076,15 @@ class DoubanArchive(_PluginBase):
                                     {"component": "VSwitch", "props": {"model": "onlyonce", "label": "立即重试失败队列"}}
                                 ],
                             },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 6},
+                                "content": [
+                                    {"component": "VSwitch",
+                                     "props": {"model": "rescan",
+                                               "label": "重扫档案（按已播放状态校正）"}}
+                                ],
+                            },
                         ],
                     },
                     {
@@ -1047,6 +1182,7 @@ class DoubanArchive(_PluginBase):
             "cookiecloud_key": "",
             "cookiecloud_password": "",
             "onlyonce": False,
+            "rescan": False,
             "pc_month": 3,
             "pc_num": 50,
             "mobile_month": 2,
@@ -1079,13 +1215,17 @@ class DoubanArchive(_PluginBase):
         if not rows:
             rows = [{"component": "VAlert", "props": {"type": "info", "variant": "tonal", "text": "暂无同步记录"}}]
 
+        watched = sum(1 for item in archive.values()
+                      if isinstance(item, dict) and item.get("status") == "collect")
+        watching = len(archive) - watched
+
         return [
             {
                 "component": "VRow",
                 "content": [
                     {
                         "component": "VCol",
-                        "props": {"cols": 12, "md": 6},
+                        "props": {"cols": 12, "md": 4},
                         "content": [
                             {"component": "VCard", "props": {"variant": "tonal"},
                              "content": [{"component": "VCardText",
@@ -1094,13 +1234,38 @@ class DoubanArchive(_PluginBase):
                     },
                     {
                         "component": "VCol",
-                        "props": {"cols": 12, "md": 6},
+                        "props": {"cols": 12, "md": 4},
+                        "content": [
+                            {"component": "VCard", "props": {"variant": "tonal"},
+                             "content": [{"component": "VCardText",
+                                          "props": {"text": f"看过：{watched} · 在看：{watching}"}}]}
+                        ],
+                    },
+                    {
+                        "component": "VCol",
+                        "props": {"cols": 12, "md": 4},
                         "content": [
                             {"component": "VCard", "props": {"variant": "tonal"},
                              "content": [{"component": "VCardText",
                                           "props": {"text": f"待重试：{len(pending)} 条"}}]}
                         ],
                     },
+                ],
+            },
+            {
+                "component": "VRow",
+                "content": [
+                    {
+                        "component": "VCol",
+                        "props": {"cols": 12},
+                        "content": [
+                            {"component": "VAlert", "props": {
+                                "type": "info", "variant": "tonal",
+                                "text": "若「在看」的条目其实早已看完（旧版本未捕获播完事件），"
+                                        "可在插件配置勾选「重扫档案」按媒体服务器的真实播放状态校正；"
+                                        "也可发送命令 /douban_rescan。重扫只升级为「看过」，不会降级已有记录。"}}
+                        ],
+                    }
                 ],
             },
             {"component": "VList", "content": rows},

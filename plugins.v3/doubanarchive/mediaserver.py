@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from typing import Any, Dict, List, Optional, Set, Tuple
+from urllib.parse import quote
 
 from app.sdk.logging import logger
 from app.sdk.services import MediaServerHelper
@@ -208,6 +209,83 @@ class MediaServerReader:
             })
         return result
 
+    def search_series(self, title: str, season: int = 0) -> Optional[str]:
+        """
+        按标题搜索剧集条目，返回剧集 ID。
+        用于重扫历史档案：档案里只有标题和豆瓣 ID，需要重新定位媒体服务器条目。
+        精确匹配优先，找不到再取第一条完全同名的结果。
+        """
+        if not title:
+            return None
+        instance, server_type = self._locate()
+        if not instance:
+            return None
+
+        cache_key = (server_type, f"search-{title}-{season}")
+        if cache_key in self._cache:
+            return self._cache[cache_key]
+
+        response = self._get(
+            instance,
+            f"[HOST]emby/Users/[USER]/Items?SearchTerm={quote(str(title))}"
+            f"&IncludeItemTypes=Series&Recursive=true&api_key=[APIKEY]",
+        )
+        items = response.get("Items") if isinstance(response, dict) else None
+        fallback: Optional[str] = None
+        for entry in items or []:
+            if not isinstance(entry, dict):
+                continue
+            item_id = str(entry.get("Id") or "")
+            if not item_id:
+                continue
+            name = str(entry.get("Name") or "").strip()
+            if name == title.strip():
+                self._cache[cache_key] = item_id
+                return item_id
+            if not fallback and name:
+                fallback = item_id
+
+        result = fallback
+        self._cache[cache_key] = result
+        return result
+
+    def get_season_play_state(self, series_id: str, season_no: int) -> Dict[int, bool]:
+        """
+        一次性读取某一季所有集的已播放状态，返回 {集号: 是否已播放}。
+        重扫档案时用它判断整季是否看完，只需一次请求。
+        """
+        if not series_id:
+            return {}
+        instance, server_type = self._locate()
+        if not instance:
+            return {}
+
+        cache_key = (server_type, f"{series_id}-playstate-{season_no}")
+        if cache_key in self._cache:
+            return dict(self._cache[cache_key])
+
+        response = self._get(
+            instance,
+            f"[HOST]emby/Shows/{series_id}/Episodes?Season={season_no}"
+            f"&IsMissing=false&api_key=[APIKEY]",
+        )
+        items = response.get("Items") if isinstance(response, dict) else None
+        state: Dict[int, bool] = {}
+        for entry in items or []:
+            if not isinstance(entry, dict):
+                continue
+            index = self._to_int(entry.get("IndexNumber"))
+            if index is None or index <= 0:
+                continue
+            user_data = entry.get("UserData")
+            if isinstance(user_data, dict) and "Played" in user_data:
+                state[index] = bool(user_data.get("Played"))
+            else:
+                state[index] = False
+
+        self._cache[cache_key] = state
+        return dict(state)
+
     def get_item_path(self, item_id: str) -> Optional[str]:
         """读取条目的物理路径，用于按媒体路径关键词过滤。"""
         if not item_id:
@@ -272,11 +350,11 @@ class MediaServerReader:
         """
         定位可用的媒体服务器实例，返回 (实例, 类型)。
         传入 server_name 时优先精确匹配，匹配不到再回退到第一个可用实例。
+        缓存以「目标服务器名」为键，目标变化时重新枚举，避免拿到别的实例。
         """
-        wanted = server_name or self._server_name
-        if getattr(self, "_located", None) is not None and not wanted:
-            return (self._located, getattr(self, "_located_type", ""))
-        if getattr(self, "_located", None) is not None and wanted == getattr(self, "_located_name", ""):
+        wanted = server_name or self._server_name or ""
+        if getattr(self, "_located", None) is not None \
+                and wanted == getattr(self, "_located_name", ""):
             return (self._located, getattr(self, "_located_type", ""))
 
         result: Tuple[Optional[Any], str] = (None, "")

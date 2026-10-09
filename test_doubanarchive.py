@@ -446,6 +446,263 @@ def test_library_id_trace_missing(DoubanArchive):
     return "None"
 
 
+@case("重扫：整季全已播放 → 升级为看过")
+def test_rescan_upgrade(DoubanArchive):
+    plugin = DoubanArchive()
+    plugin._enabled = True
+    plugin._cookie = "ck=x"
+    plugin._libraries = []
+    plugin.save_data("archive", {
+        "征途_S1": {"title": "征途", "subject_name": "征途", "subject_id": "38192991",
+                    "season": 1, "episode": 28, "type": "电视剧", "status": "do",
+                    "timestamp": "2026-10-09 09:27:16"},
+    })
+
+    class _R:
+        def search_series(self, title, season=0):
+            return "emby-series-1"
+
+        def get_season_play_state(self, series_id, season):
+            return {i: True for i in range(1, 29)}   # 28 集全看完
+
+    written = []
+
+    class _C:
+        def has_login(self):
+            return True
+
+        def set_status(self, subject_id, status="do", private=True):
+            written.append((subject_id, status))
+            return True
+
+    import doubanarchive as mod
+    orig_reader, orig_client = plugin._reader, mod.DoubanClient
+    plugin._reader = lambda *a, **k: _R()
+    mod.DoubanClient = lambda *a, **k: _C()
+    try:
+        result = plugin.rescan_archive()
+    finally:
+        plugin._reader, mod.DoubanClient = orig_reader, orig_client
+
+    assert result["upgraded"] == 1, result
+    assert written == [("38192991", "collect")], written
+    assert plugin.get_data("archive")["征途_S1"]["status"] == "collect"
+    return f"升级 {result['upgraded']} 条"
+
+
+@case("重扫：只看完部分集 → 不升级")
+def test_rescan_partial(DoubanArchive):
+    plugin = DoubanArchive()
+    plugin._enabled = True
+    plugin._cookie = "ck=x"
+    plugin.save_data("archive", {
+        "某剧_S1": {"title": "某剧", "subject_name": "某剧", "subject_id": "999",
+                    "season": 1, "episode": 5, "type": "电视剧", "status": "do"},
+    })
+
+    class _R:
+        def search_series(self, title, season=0):
+            return "s-2"
+
+        def get_season_play_state(self, series_id, season):
+            state = {i: True for i in range(1, 29)}
+            state[28] = False    # 最后一集没看完
+            return state
+
+    class _C:
+        def has_login(self):
+            return True
+
+        def set_status(self, *a, **k):
+            raise AssertionError("未看完不应写入豆瓣")
+
+    import doubanarchive as mod
+    orig_reader, orig_client = plugin._reader, mod.DoubanClient
+    plugin._reader = lambda *a, **k: _R()
+    mod.DoubanClient = lambda *a, **k: _C()
+    try:
+        result = plugin.rescan_archive()
+    finally:
+        plugin._reader, mod.DoubanClient = orig_reader, orig_client
+
+    assert result["upgraded"] == 0, result
+    assert result["skipped"] == 1, result
+    assert plugin.get_data("archive")["某剧_S1"]["status"] == "do"
+    return "保持在看"
+
+
+@case("重扫：已是看过的条目跳过，不降级")
+def test_rescan_skip_collect(DoubanArchive):
+    plugin = DoubanArchive()
+    plugin._enabled = True
+    plugin._cookie = "ck=x"
+    plugin.save_data("archive", {
+        "某剧_S1": {"title": "某剧", "subject_name": "某剧", "subject_id": "1",
+                    "season": 1, "episode": 10, "type": "电视剧", "status": "collect"},
+    })
+
+    class _R:
+        def search_series(self, title, season=0):
+            raise AssertionError("已是看过的条目不应再查媒体服务器")
+
+    class _C:
+        def has_login(self):
+            return True
+
+        def set_status(self, *a, **k):
+            raise AssertionError("已是看过的不应重写")
+
+    import doubanarchive as mod
+    orig_reader, orig_client = plugin._reader, mod.DoubanClient
+    plugin._reader = lambda *a, **k: _R()
+    mod.DoubanClient = lambda *a, **k: _C()
+    try:
+        result = plugin.rescan_archive()
+    finally:
+        plugin._reader, mod.DoubanClient = orig_reader, orig_client
+
+    assert result["skipped"] == 1, result
+    assert result["upgraded"] == 0, result
+    return "skipped"
+
+
+@case("重扫：电影不参与重扫")
+def test_rescan_skip_movie(DoubanArchive):
+    plugin = DoubanArchive()
+    plugin._enabled = True
+    plugin._cookie = "ck=x"
+    plugin.save_data("archive", {
+        "功夫女足": {"title": "功夫女足", "subject_name": "功夫女足", "subject_id": "2",
+                    "season": 0, "episode": 0, "type": "电影", "status": "do"},
+    })
+
+    class _R:
+        def search_series(self, title, season=0):
+            raise AssertionError("电影不应进入剧集搜索")
+
+    class _C:
+        def has_login(self):
+            return True
+
+        def set_status(self, *a, **k):
+            raise AssertionError("电影不应重写")
+
+    import doubanarchive as mod
+    orig_reader, orig_client = plugin._reader, mod.DoubanClient
+    plugin._reader = lambda *a, **k: _R()
+    mod.DoubanClient = lambda *a, **k: _C()
+    try:
+        result = plugin.rescan_archive()
+    finally:
+        plugin._reader, mod.DoubanClient = orig_reader, orig_client
+
+    assert result["skipped"] == 1, result
+    return "skipped"
+
+
+@case("重扫：媒体服务器查不到 → 原样保留")
+def test_rescan_not_found(DoubanArchive):
+    plugin = DoubanArchive()
+    plugin._enabled = True
+    plugin._cookie = "ck=x"
+    plugin.save_data("archive", {
+        "某剧_S1": {"title": "某剧", "subject_name": "某剧", "subject_id": "3",
+                    "season": 1, "episode": 5, "type": "电视剧", "status": "do"},
+    })
+
+    class _R:
+        def search_series(self, title, season=0):
+            return None
+
+    class _C:
+        def has_login(self):
+            return True
+
+        def set_status(self, *a, **k):
+            raise AssertionError("查不到条目不应写豆瓣")
+
+    import doubanarchive as mod
+    orig_reader, orig_client = plugin._reader, mod.DoubanClient
+    plugin._reader = lambda *a, **k: _R()
+    mod.DoubanClient = lambda *a, **k: _C()
+    try:
+        result = plugin.rescan_archive()
+    finally:
+        plugin._reader, mod.DoubanClient = orig_reader, orig_client
+
+    assert result["skipped"] == 1, result
+    assert plugin.get_data("archive")["某剧_S1"]["status"] == "do"
+    return "skipped"
+
+
+@case("重扫：cookie 为空时中止，不动档案")
+def test_rescan_no_cookie(DoubanArchive):
+    plugin = DoubanArchive()
+    plugin._enabled = True
+    plugin._cookie = ""
+    plugin._use_cookiecloud = False
+    plugin.save_data("archive", {
+        "某剧_S1": {"title": "某剧", "subject_name": "某剧", "subject_id": "4",
+                    "season": 1, "episode": 5, "type": "电视剧", "status": "do"},
+    })
+
+    class _R:
+        def search_series(self, title, season=0):
+            raise AssertionError("无 cookie 不该查媒体服务器")
+
+    import doubanarchive as mod
+    orig_reader = plugin._reader
+    plugin._reader = lambda *a, **k: _R()
+    try:
+        result = plugin.rescan_archive()
+    finally:
+        plugin._reader = orig_reader
+
+    assert result["failed"] == 1, result
+    assert plugin.get_data("archive")["某剧_S1"]["status"] == "do"
+    return "中止"
+
+
+@case("重扫：剧集搜索优先精确同名匹配")
+def test_search_series_exact(DoubanArchive):
+    sys.path.insert(0, r"C:\Users\Li\WorkBuddy\2026-10-09-10-31-43\mp-plugins\plugins.v3")
+    from doubanarchive.mediaserver import MediaServerReader
+    reader = MediaServerReader(server_name="emby")
+    payload = {"Items": [
+        {"Id": "x1", "Name": "征途纪实"},
+        {"Id": "x2", "Name": "征途"},
+    ]}
+
+    class _Inst:
+        def get_data(self, url):
+            return types.SimpleNamespace(status_code=200,
+                                          json=lambda: payload)
+
+    reader._located = _Inst()
+    reader._located_type = "emby"
+    reader._located_name = "emby"
+    assert reader.search_series("征途") == "x2"
+    return "x2"
+
+
+@case("剧集搜索：找不到同名时回退第一条")
+def test_search_series_fallback(DoubanArchive):
+    sys.path.insert(0, r"C:\Users\Li\WorkBuddy\2026-10-09-10-31-43\mp-plugins\plugins.v3")
+    from doubanarchive.mediaserver import MediaServerReader
+    reader = MediaServerReader(server_name="emby")
+    payload = {"Items": [{"Id": "y1", "Name": "完全不同的名字"}]}
+
+    class _Inst:
+        def get_data(self, url):
+            return types.SimpleNamespace(status_code=200, json=lambda: payload)
+
+    reader._located = _Inst()
+    reader._located_type = "emby"
+    reader._located_name = "emby"
+    assert reader.search_series("征途") == "y1"
+    return "y1"
+
+
 def main():
     DoubanArchive = load_plugin_base()
     print("=" * 62)
