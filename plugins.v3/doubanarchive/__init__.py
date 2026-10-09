@@ -65,7 +65,7 @@ class DoubanArchive(_PluginBase):
     plugin_name = "豆瓣档案同步"
     plugin_desc = "将在看、看完状态同步到豆瓣书影音档案，不依赖 TMDB 识别，失败自动重试。"
     plugin_icon = "Douban_A.png"
-    plugin_version = "1.7.2"
+    plugin_version = "1.8.0"
     plugin_author = "liclown2020"
     author_url = "https://github.com/liclown2020"
     plugin_config_prefix = "doubanarchive_"
@@ -229,7 +229,19 @@ class DoubanArchive(_PluginBase):
                 "auth": "bear",
                 "summary": "全量扫描媒体库并导入已看完的剧集",
             },
+            {
+                "path": "/login_check",
+                "endpoint": self.api_login_check,
+                "methods": ["GET"],
+                "auth": "bear",
+                "summary": "诊断豆瓣 cookie 登录状态",
+            },
         ]
+
+    def api_login_check(self) -> Dict[str, Any]:
+        """返回豆瓣 cookie 的登录状态诊断结果。"""
+        client = DoubanClient(cookie=self._load_cookie())
+        return client.diagnose_login()
 
     def api_rescan(self) -> Dict[str, Any]:
         """
@@ -493,8 +505,11 @@ class DoubanArchive(_PluginBase):
 
         client = DoubanClient(cookie=self._load_cookie())
         if not client.has_login():
-            logger.error("豆瓣 cookie 为空，无法重扫档案")
+            detail = client.diagnose_login()
+            logger.error(f"豆瓣未登录，无法重扫档案：缺少 {detail['missing_keys']}")
             summary["failed"] = len(archive)
+            summary["trace"] = [{"result":
+                "豆瓣未登录，cookie 缺少 " + "、".join(detail["missing_keys"])}]
             return summary
 
         reader = self._reader()
@@ -629,9 +644,12 @@ class DoubanArchive(_PluginBase):
 
         client = DoubanClient(cookie=self._load_cookie())
         if not client.has_login():
-            logger.error("豆瓣 cookie 为空，无法导入")
+            detail = client.diagnose_login()
+            logger.error(f"豆瓣未登录，无法导入：缺少 {detail['missing_keys']}")
             summary["failed"] = 1
-            summary["reasons"].append("豆瓣 cookie 为空")
+            summary["reasons"].append(
+                "豆瓣未登录，cookie 缺少 " + "、".join(detail["missing_keys"])
+                + "，需从已登录的浏览器重新复制")
             return summary
 
         selected = self._selected_libraries()
