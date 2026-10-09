@@ -142,7 +142,7 @@ class EpisodeNoExistV3(_PluginBase):
     # 插件图标
     plugin_icon = "episodenoexist.png"
     # 插件版本
-    plugin_version = "1.0.0"
+    plugin_version = "1.0.1"
     # 插件作者
     plugin_author = "boeto / liclown2020"
     # 作者主页
@@ -170,6 +170,7 @@ class EpisodeNoExistV3(_PluginBase):
 
     _history_type: str = HistoryDataType.LATEST.value
     _no_exist_action: str = NoExistAction.ONLY_HISTORY.value
+    _only_exist_season: bool = False
     _save_path_replaces: List[str] = []
     _whitelist_librarys: List[str] = []
     _whitelist_media_servers: List[str] = []
@@ -191,6 +192,10 @@ class EpisodeNoExistV3(_PluginBase):
             self._no_exist_action = config.get(
                 "no_exist_action", NoExistAction.ONLY_HISTORY.value
             )
+
+            # 仅检查媒体库里已存在的季：库里完全没有的季不参与检查、不自动订阅。
+            # 适合「只补漏、不想被尚未入库的季刷屏」的场景。
+            self._only_exist_season = bool(config.get("only_exist_season", False))
 
             self._history_type = config.get(
                 "history_type", HistoryDataType.LATEST.value
@@ -381,17 +386,21 @@ class EpisodeNoExistV3(_PluginBase):
 
     def __season_episodes(
         self, server: str, item_id: str, media_source: str | None, media_id: str | None
-    ) -> Dict[int, List[int]]:
+    ) -> Tuple[bool, Dict[int, List[int]]]:
         """
         读取媒体库中某个剧集条目实际存在的集号，按季归组。
 
         走宿主媒体服务器模块的 get_tv_episodes()：它内部按季分组返回
-        {季号: [集号]}，并已处理好「缓存 item_id 失效时按标题回退搜索」，
-        与宿主判断剧集存在性的口径一致。读取失败返回空字典。
+        {季号: [集号]}，并已处理好「缓存 item_id失效时按标题回退搜索」，
+        与宿主判断剧集存在性的口径一致。
+
+        返回 (读取成功, {季号: [集号]})。必须区分「读取失败」与「库里一集都没有」：
+        前者是接口异常，应跳过本条；后者是真实的全季缺失，要参与统计。
+        两者都返回空字典会让失败被当成「整部剧所有季都缺」。
         """
         instance = self.__instance(server)
         if instance is None:
-            return {}
+            return False, {}
 
         try:
             result = instance.get_tv_episodes(
@@ -405,22 +414,30 @@ class EpisodeNoExistV3(_PluginBase):
                 result = instance.get_tv_episodes(item_id=item_id)
             except Exception as err:
                 logger.warning(f"读取【{item_id}】集号失败：{err}")
-                return {}
+                return False, {}
         except Exception as err:
             logger.warning(f"读取【{item_id}】集号失败：{err}")
-            return {}
+            return False, {}
 
-        # 返回 (item_id, {季: [集号]})，第二项为None 表示读取失败
-        seasoninfo: Any = None
-        if isinstance(result, tuple):
-            seasoninfo = result[1] if len(result) > 1 else None
-        elif isinstance(result, dict):
-            seasoninfo = result
+        # 返回 (item_id, {季: [集号]})；item_id 为 None 或第二项为 None 均视为读取失败
+        if not isinstance(result, tuple) or len(result) < 2:
+            logger.warning(f"读取【{item_id}】集号返回格式异常：{type(result)}")
+            return False, {}
+
+        resolved_id, seasoninfo = result[0], result[1]
+        if resolved_id is None or seasoninfo is None:
+            logger.warning(
+                f"读取【{item_id}】集号失败：媒体服务器未能定位该剧集"
+                f"（可能已被删除或重新入库）"
+            )
+            return False, {}
+
         if not seasoninfo:
-            logger.debug(f"【{item_id}】未读取到任何集号，按全部缺失处理")
-            return {}
+            # 定位成功但库里没有任何集：真实的全季缺失
+            logger.debug(f"【{item_id}】媒体库中没有任何集，按全部缺失处理")
+            return True, {}
 
-        return {
+        return True, {
             int(season): sorted({int(num) for num in numbers or [] if num})
             for season, numbers in seasoninfo.items()
             if season is not None
@@ -501,6 +518,10 @@ class EpisodeNoExistV3(_PluginBase):
         item_unique_flags = history.get("item_unique_flags", [])
         logger.debug(f"item_unique_flags: {item_unique_flags}")
 
+        # 本轮统计，用于结束时汇总
+        stat_total = 0# 枚举到的条目总数
+        stat_failed = 0      # 处理过程中出错的条目数
+
         # 遍历媒体服务器
         for mediaserver in mediaservers:
             if (
@@ -515,155 +536,201 @@ class EpisodeNoExistV3(_PluginBase):
                 library_name = library["name"]
                 logger.debug(f"媒体库名：{library_name}")
                 if library_name not in self._whitelist_librarys:
+                    logger.debug(
+                        f"媒体库【{library_name}】不在白名单内, 跳过"
+                        f"（当前白名单: {self._whitelist_librarys}）"
+                    )
                     continue
                 logger.info(f"正在获取 {mediaserver} 媒体库 {library_name} ...")
 
-                for item in self.__media_items(mediaserver, library_id):
-                    if not item:
-                        logger.debug("未获取到Item媒体信息, 跳过获取缺失集数")
-                        continue
+                items = self.__media_items(mediaserver, library_id)
+                stat_total += len(items)
+                logger.info(
+                    f"媒体库【{library_name}】共枚举到 {len(items)} 个条目, 开始逐部检查"
+                )
 
-                    item_id = self.__item_attr(item, "item_id")
-                    if not item_id:
-                        logger.debug("未获取到Item ID, 跳过获取缺失集数")
-                        continue
-                    item_id = str(item_id)
-
-                    item_title = (
-                        self.__item_attr(item, "title")
-                        or self.__item_attr(item, "original_title")
-                        or f"ItemID: {item_id}"
-                    )
-
-                    item_unique_flag = f"{mediaserver}_{library_id}_{item_id}_{item_title}"
-
-                    if item_unique_flag in item_unique_flags:
-                        logger.info(f"【{item_title}】已处理过, 跳过")
-                        continue
-
-                    logger.info(f"正在获取 {item_title} ...")
-
-                    seasoninfo: Dict[int, List[int]] = {}
-
-                    # 类型：V3 的 item_type 已由宿主归一为 MediaType 值
-                    raw_item_type = str(self.__item_attr(item, "item_type") or "").lower()
-                    if raw_item_type in ("series", "show", MediaType.TV.value.lower()):
-                        item_type = MediaType.TV.value
-                    elif raw_item_type in ("movie", MediaType.MOVIE.value.lower()):
-                        item_type = MediaType.MOVIE.value
-                    else:
-                        item_type = MediaType.TV.value
-
-                    if item_type == MediaType.MOVIE.value:
-                        logger.warning(f"【{item_title}】为{MediaType.MOVIE.value}, 跳过")
-                        continue
-
-                    # V3 媒体身份：media_source + media_id 成对存在
-                    media_source = self.__item_attr(item, "media_source")
-                    media_id = self.__item_attr(item, "media_id")
-                    # 兼容仍按 V2 结构返回 tmdbid 的宿主/适配器
-                    legacy_tmdbid = self.__item_attr(item, "tmdbid")
-                    if not media_id and legacy_tmdbid:
-                        media_source = media_source or "themoviedb"
-                        media_id = str(legacy_tmdbid)
-
-                    if item_type == MediaType.TV.value and media_id:
-                        seasoninfo = self.__season_episodes(
-                            mediaserver, item_id, media_source, media_id
+                for item in items:
+                    try:
+                        self.__process_item(
+                            item,
+                            mediaserver=mediaserver,
+                            library_id=library_id,
+                            library_name=library_name,
+                            history=history,
+                            item_unique_flags=item_unique_flags,
+                            append_history=__append_history,
                         )
-                        logger.debug(
-                            f"获取到媒体库【{item_title}】季集信息:{seasoninfo}"
+                    except Exception as err:
+                        # 任何单部剧的异常都不允许中断整轮扫描
+                        stat_failed += 1
+                        title = self.__item_attr(item, "title") if item else None
+                        logger.warning(
+                            f"处理【{title or '未知条目'}】时出错，已跳过本条：{err}"
                         )
-
-                    # 插入数据
-                    item_dict: Dict[str, Any] = {
-                        "title": self.__item_attr(item, "title"),
-                        "original_title": self.__item_attr(item, "original_title"),
-                        "year": self.__item_attr(item, "year"),
-                        "path": self.__item_attr(item, "path"),
-                        "media_source": str(media_source) if media_source else None,
-                        "media_id": str(media_id) if media_id else None,
-                        "tmdbid": int(media_id)
-                        if media_id and str(media_source or "themoviedb") == "themoviedb"
-                        and str(media_id).isdigit()
-                        else None,
-                        "seasoninfo": seasoninfo,
-                        "item_type": item_type,
-                    }
-
-                    logger.info(f"获到媒体库【{item_title}】数据：{item_dict}")
-
-                    is_add_subscribe_success, tv_no_exist_info = (
-                        self.__get_item_no_exist_info(item_dict)
-                    )
-
-                    if is_add_subscribe_success and tv_no_exist_info:
-                        if tv_no_exist_info.season_episode_no_exist_info is None:
-                            logger.info(f"【{item_title}】所有季集均已存在/订阅")
-                            __append_history(
-                                item_unique_flag=item_unique_flag,
-                                exist_status=HistoryStatus.ALL_EXIST,
-                                tv_no_exist_info=tv_no_exist_info,
-                            )
-                        else:
-                            logger.info(f"【{item_title}】缺失集数信息：{tv_no_exist_info}")
-
-                            if (
-                                self._no_exist_action
-                                == NoExistAction.ADD_SUBSCRIBE.value
-                            ):
-                                logger.info("开始订阅缺失集数")
-                                is_add_subscribe_success = (
-                                    self.__add_subscribe_by_tv_no_exist_info(
-                                        tv_no_exist_info, item_unique_flag
-                                    )
-                                )
-                                if is_add_subscribe_success:
-                                    __append_history(
-                                        item_unique_flag=item_unique_flag,
-                                        exist_status=HistoryStatus.ADDED_RSS,
-                                        tv_no_exist_info=tv_no_exist_info,
-                                    )
-                                else:
-                                    logger.warning(
-                                        f"订阅【{item_title}】失败, 仅记录缺失集数"
-                                    )
-                                    __append_history(
-                                        item_unique_flag=item_unique_flag,
-                                        exist_status=HistoryStatus.NO_EXIST,
-                                        tv_no_exist_info=tv_no_exist_info,
-                                    )
-                            elif (
-                                self._no_exist_action
-                                == NoExistAction.SET_ALL_EXIST.value
-                            ):
-                                logger.debug("将缺失季集标记为存在")
-                                __append_history(
-                                    item_unique_flag=item_unique_flag,
-                                    exist_status=HistoryStatus.ALL_EXIST,
-                                    tv_no_exist_info=tv_no_exist_info,
-                                )
-
-                            else:
-                                logger.debug("仅记录缺失集数")
-                                __append_history(
-                                    item_unique_flag=item_unique_flag,
-                                    exist_status=HistoryStatus.NO_EXIST,
-                                    tv_no_exist_info=tv_no_exist_info,
-                                )
-                    else:
-                        logger.warning(f"【{item_title}】获取缺失集数信息失败")
-                        __append_history(
-                            item_unique_flag=item_unique_flag,
-                            exist_status=HistoryStatus.FAILED,
-                            tv_no_exist_info=tv_no_exist_info,
-                        )
+                        continue
 
                 logger.info(f"{mediaserver} 媒体库 {library_name} 获取数据完成")
 
         logger.info(
-            f"媒体库缺失集数据获取完成, 已处理媒体数量: {len(item_unique_flags)}"
+            f"媒体库缺失集数据获取完成, 本轮枚举 {stat_total} 个条目, "
+            f"处理出错 {stat_failed} 个, 累计已检查 {len(item_unique_flags)} 部"
         )
+
+    def __process_item(
+        self,
+        item: Any,
+        mediaserver: str,
+        library_id: str,
+        library_name: str,
+        history: Dict[str, Any],
+        item_unique_flags: List[str],
+        append_history: Any,
+    ):
+        """处理单个媒体库条目。由外层循环兜异常，保证单条失败不影响整轮。"""
+        if not item:
+            logger.debug("未获取到Item媒体信息, 跳过获取缺失集数")
+            return
+
+        item_id = self.__item_attr(item, "item_id")
+        if not item_id:
+            logger.debug("未获取到Item ID, 跳过获取缺失集数")
+            return
+        item_id = str(item_id)
+
+        item_title = (
+            self.__item_attr(item, "title")
+            or self.__item_attr(item, "original_title")
+            or f"ItemID: {item_id}"
+        )
+
+        item_unique_flag = f"{mediaserver}_{library_id}_{item_id}_{item_title}"
+
+        if item_unique_flag in item_unique_flags:
+            logger.info(f"【{item_title}】已处理过, 跳过")
+            return
+
+        logger.info(f"正在获取 {item_title} ...")
+
+        seasoninfo: Dict[int, List[int]] = {}
+
+        # 类型：V3 的 item_type 已由宿主归一为 MediaType 值
+        raw_item_type = str(self.__item_attr(item, "item_type") or "").lower()
+        if raw_item_type in ("series", "show", MediaType.TV.value.lower()):
+            item_type = MediaType.TV.value
+        elif raw_item_type in ("movie", MediaType.MOVIE.value.lower()):
+            item_type = MediaType.MOVIE.value
+        else:
+            item_type = MediaType.TV.value
+
+        if item_type == MediaType.MOVIE.value:
+            logger.debug(f"【{item_title}】为{MediaType.MOVIE.value}, 跳过")
+            return
+
+        # V3 媒体身份：media_source + media_id 成对存在
+        media_source = self.__item_attr(item, "media_source")
+        media_id = self.__item_attr(item, "media_id")
+        # 兼容仍按 V2 结构返回 tmdbid 的宿主/适配器
+        legacy_tmdbid = self.__item_attr(item, "tmdbid")
+        if not media_id and legacy_tmdbid:
+            media_source = media_source or "themoviedb"
+            media_id = str(legacy_tmdbid)
+
+        if item_type == MediaType.TV.value and media_id:
+            read_ok, seasoninfo = self.__season_episodes(
+                mediaserver, item_id, media_source, media_id
+            )
+            if not read_ok:
+                # 读不到集号就不能判断缺失，跳过本条，避免把接口故障当成「整部剧全缺」
+                logger.warning(
+                    f"【{item_title}】无法读取集号，跳过缺失判断"
+                    f"（不影响其他条目继续扫描）"
+                )
+                return
+            logger.debug(f"获取到媒体库【{item_title}】季集信息:{seasoninfo}")
+
+        # 插入数据
+        item_dict: Dict[str, Any] = {
+            "title": self.__item_attr(item, "title"),
+            "original_title": self.__item_attr(item, "original_title"),
+            "year": self.__item_attr(item, "year"),
+            "path": self.__item_attr(item, "path"),
+            "media_source": str(media_source) if media_source else None,
+            "media_id": str(media_id) if media_id else None,
+            "tmdbid": int(media_id)
+                if media_id and str(media_source or "themoviedb") == "themoviedb"
+                    and str(media_id).isdigit()
+                else None,
+            "seasoninfo": seasoninfo,
+            "item_type": item_type,
+        }
+
+        logger.info(f"获到媒体库【{item_title}】数据：{item_dict}")
+
+        is_add_subscribe_success, tv_no_exist_info = (
+            self.__get_item_no_exist_info(item_dict)
+        )
+
+        if is_add_subscribe_success and tv_no_exist_info:
+            if tv_no_exist_info.season_episode_no_exist_info is None:
+                logger.info(f"【{item_title}】所有季集均已存在/订阅")
+                append_history(
+                    item_unique_flag=item_unique_flag,
+                    exist_status=HistoryStatus.ALL_EXIST,
+                    tv_no_exist_info=tv_no_exist_info,
+                )
+            else:
+                logger.info(f"【{item_title}】缺失集数信息：{tv_no_exist_info}")
+
+                if (
+                    self._no_exist_action
+                    == NoExistAction.ADD_SUBSCRIBE.value
+                ):
+                    logger.info("开始订阅缺失集数")
+                    is_add_subscribe_success = (
+                        self.__add_subscribe_by_tv_no_exist_info(
+                            tv_no_exist_info, item_unique_flag
+                        )
+                    )
+                    if is_add_subscribe_success:
+                        append_history(
+                            item_unique_flag=item_unique_flag,
+                            exist_status=HistoryStatus.ADDED_RSS,
+                            tv_no_exist_info=tv_no_exist_info,
+                        )
+                    else:
+                        logger.warning(
+                            f"订阅【{item_title}】失败, 仅记录缺失集数"
+                        )
+                        append_history(
+                            item_unique_flag=item_unique_flag,
+                            exist_status=HistoryStatus.NO_EXIST,
+                            tv_no_exist_info=tv_no_exist_info,
+                        )
+                elif (
+                    self._no_exist_action
+                    == NoExistAction.SET_ALL_EXIST.value
+                ):
+                    logger.debug("将缺失季集标记为存在")
+                    append_history(
+                        item_unique_flag=item_unique_flag,
+                        exist_status=HistoryStatus.ALL_EXIST,
+                        tv_no_exist_info=tv_no_exist_info,
+                    )
+
+                else:
+                    logger.debug("仅记录缺失集数")
+                    append_history(
+                        item_unique_flag=item_unique_flag,
+                        exist_status=HistoryStatus.NO_EXIST,
+                        tv_no_exist_info=tv_no_exist_info,
+                    )
+        else:
+            logger.warning(f"【{item_title}】获取缺失集数信息失败")
+            append_history(
+                item_unique_flag=item_unique_flag,
+                exist_status=HistoryStatus.FAILED,
+                tv_no_exist_info=tv_no_exist_info,
+            )
 
     def __media_items(self, server: str, library_id: str):
         """读取指定媒体库下的全部剧集条目，失败返回空列表。"""
@@ -732,11 +799,20 @@ class EpisodeNoExistV3(_PluginBase):
         logger.debug(f"【{title}】在媒体库已存在季集信息：{exist_season_info}")
 
         # 获取媒体信息（V3 用 media_source + media_id）
-        tmdbinfo = self.mediachain.recognize_media(
-            mtype=mtype,
-            media_source=media_source,
-            media_id=str(media_id),
-        )
+        # recognize_media 内部要走 TMDB 网络，超时/不通会抛异常。
+        # 这里必须兜住：扫描循环是逐部剧串行跑的，一部抛错会中断整轮扫描，
+        # 表现为「日志里只检查了一部电视剧」。
+        try:
+            tmdbinfo = self.mediachain.recognize_media(
+                mtype=mtype,
+                media_source=media_source,
+                media_id=str(media_id),
+            )
+        except Exception as err:
+            logger.warning(
+                f"【{title}】识别媒体信息异常（{media_source}:{media_id}）：{err}"
+            )
+            return False, tv_no_exist_info
 
         if tmdbinfo:
             logger.debug(f"【{title}】获取到媒体信息::: {tmdbinfo}")
@@ -764,6 +840,13 @@ class EpisodeNoExistV3(_PluginBase):
                 logger.debug(f"【{title}】全部季不存在, 添加全部季集数")
                 # 全部季不存在
                 for season, _ in tmdbinfo_seasons:
+                    if self._only_exist_season:
+                        # 只检查已存在的季，而库里一集都没有 → 本片无需检查
+                        logger.debug(
+                            f"【{title}】开启了「仅检查已有季」, "
+                            f"媒体库中无任何集, 跳过本片"
+                        )
+                        break
                     filted_episodes = self.__filter_episodes(tmdbid, season)
                     if not filted_episodes:
                         logger.debug(
@@ -828,6 +911,15 @@ class EpisodeNoExistV3(_PluginBase):
                             episode_total=episode_total,
                         )
                     else:
+                        # 该季在媒体库里一集都没有
+                        if self._only_exist_season:
+                            # 只补漏：库里没有的季不管，避免把整部未入库的剧
+                            # 也算成「缺失」并触发自动订阅
+                            logger.debug(
+                                f"【{title}】第【{season}】季媒体库无集，"
+                                f"已开启「仅检查已有季」, 跳过该季"
+                            )
+                            continue
                         logger.debug(f"【{title}】第【{season}】季全集不存在")
                         # 判断用户是否已经添加订阅
                         if self.__subscribe_exists(
@@ -953,6 +1045,7 @@ class EpisodeNoExistV3(_PluginBase):
             "clear": self._clear,
             "history_type": self._history_type,
             "no_exist_action": self._no_exist_action,
+            "only_exist_season": self._only_exist_season,
             "save_path_replaces": "\n".join(map(str, self._save_path_replaces)),
             "whitelist_librarys": ",".join(map(str, self._whitelist_librarys)),
             "whitelist_media_servers": ",".join(
@@ -1407,6 +1500,24 @@ class EpisodeNoExistV3(_PluginBase):
                                 "props": {"cols": 12, "md": 12},
                                 "content": [
                                     {
+                                        "component": "VSwitch",
+                                        "props": {
+                                            "model": "only_exist_season",
+                                            "label": "仅检查已有季（媒体库里完全没有的季不检查、不自动订阅，只补已有季里的漏集）",
+                                        },
+                                    }
+                                ],
+                            },
+                        ],
+                    },
+                    {
+                        "component": "VRow",
+                        "content": [
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 12},
+                                "content": [
+                                    {
                                         "component": "VSelect",
                                         "props": {
                                             "multiple": True,
@@ -1469,6 +1580,7 @@ class EpisodeNoExistV3(_PluginBase):
             "history_type": HistoryDataType.LATEST.value,
             "save_path_replaces": "",
             "no_exist_action": NoExistAction.ONLY_HISTORY.value,
+            "only_exist_season": False,
             "whitelist_media_servers": [],
             "whitelist_librarys": "",
         }
