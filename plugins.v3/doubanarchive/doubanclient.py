@@ -44,8 +44,42 @@ class DoubanClient:
     # ---------------- 对外能力 ----------------
 
     def has_login(self) -> bool:
-        """判断当前是否具备写入豆瓣的登录态。"""
-        return bool(self.cookies)
+        """
+        判断当前 cookie 是否为已登录状态。
+
+        仅判断 cookie 非空是不够的：未登录访问豆瓣也会拿到一批
+        统计类 cookie（_ga、__utm*、ck、bid 等），它们不含任何登录凭证，
+        用这样的 cookie 请求豆瓣接口只会得到空结果。
+        这里检查关键登录凭证是否齐全。
+        """
+        if not self.cookies:
+            return False
+        required = ("login_flag", "db_sid")
+        present = {item.split("=", 1)[0].strip() for item in self.cookie_header().split(";")}
+        return all(key in present for key in required)
+
+    def diagnose_login(self) -> Dict[str, Any]:
+        """
+        诊断 cookie 的登录状态，返回缺失项与实测搜索结果。
+
+        排查「扫描一直失败」时，先看这个接口：cookie 非空不代表已登录，
+        未登录时豆瓣搜索返回空，最终表现为写入时 404。
+        """
+        present = {item.split("=", 1)[0].strip() for item in self.cookie_header().split(";")}
+        required = ("login_flag", "db_sid", "UE")
+        missing = [key for key in required if key not in present]
+
+        probe_name, probe_id = self.search("老舅", "TV")
+        return {
+            "cookie_count": len(present),
+            "logged_in": not missing,
+            "missing_keys": missing,
+            "probe_title": probe_name,
+            "probe_subject_id": probe_id,
+            "probe_ok": bool(probe_id),
+            "hint": "cookie 中缺少登录凭证，需从已登录的浏览器重新复制"
+                    if missing else "",
+        }
 
     def search(self, title: str, media_type: str = "TV") -> Tuple[Optional[str], Optional[str]]:
         """
