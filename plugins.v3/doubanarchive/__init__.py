@@ -65,7 +65,7 @@ class DoubanArchive(_PluginBase):
     plugin_name = "豆瓣档案同步"
     plugin_desc = "将在看、看完状态同步到豆瓣书影音档案，不依赖 TMDB 识别，失败自动重试。"
     plugin_icon = "Douban_A.png"
-    plugin_version = "1.5.1"
+    plugin_version = "1.6.0"
     plugin_author = "liclown2020"
     author_url = "https://github.com/liclown2020"
     plugin_config_prefix = "doubanarchive_"
@@ -255,6 +255,8 @@ class DoubanArchive(_PluginBase):
                 series_id = reader.search_series(entry["title"], self._to_int(record.get("season"), 0, 0))
                 entry["series_id"] = series_id or ""
                 if not series_id:
+                    entry["candidates"] = reader.build_title_candidates(
+                        entry["title"], self._to_int(record.get("season"), 0, 0))
                     entry["result"] = "未搜索到剧集条目"
                     report["items"].append(entry)
                     continue
