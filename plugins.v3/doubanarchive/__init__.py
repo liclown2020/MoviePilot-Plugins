@@ -65,7 +65,7 @@ class DoubanArchive(_PluginBase):
     plugin_name = "豆瓣档案同步"
     plugin_desc = "将在看、看完状态同步到豆瓣书影音档案，不依赖 TMDB 识别，失败自动重试。"
     plugin_icon = "Douban_A.png"
-    plugin_version = "1.7.1"
+    plugin_version = "1.7.2"
     plugin_author = "liclown2020"
     author_url = "https://github.com/liclown2020"
     plugin_config_prefix = "doubanarchive_"
@@ -470,7 +470,8 @@ class DoubanArchive(_PluginBase):
         - 电影不做批量重扫（没有集号概念，直接看事件更准）；
         - 媒体服务器查不到的条目原样保留，不猜测。
         """
-        summary = {"total": 0, "upgraded": 0, "skipped": 0, "failed": 0, "details": []}
+        summary = {"total": 0, "upgraded": 0, "corrected": 0, "skipped": 0,
+                   "failed": 0, "details": []}
         if not self._enabled:
             logger.warn("插件未启用，无法重扫档案")
             return summary
@@ -493,6 +494,7 @@ class DoubanArchive(_PluginBase):
         logger.info(f"开始重扫豆瓣档案，共 {summary['total']} 条")
 
         updates: Dict[str, Dict[str, Any]] = {}
+        corrections: Dict[str, Dict[str, Any]] = {}
         trace: List[Dict[str, Any]] = []
         for key, record in archive.items():
             if not isinstance(record, dict):
@@ -501,10 +503,6 @@ class DoubanArchive(_PluginBase):
             step: Dict[str, Any] = {"title": title, "season": record.get("season")}
             trace.append(step)
 
-            if record.get("status") == "collect":
-                step["result"] = "已是看过，跳过"
-                summary["skipped"] += 1
-                continue
             # 电影没有集号概念，不参与重扫
             if not str(record.get("type") or "").startswith("电视剧"):
                 step["result"] = "非剧集，跳过"
@@ -543,11 +541,39 @@ class DoubanArchive(_PluginBase):
                     continue
 
                 played_true = sum(1 for value in state.values() if value)
-                if played_true < len(state):
-                    # 把未看完的集号记下来，便于判断是哪几集没看
+                # 连载中的剧即使当前最大集号已看完，也只是「看到了已更新的部分」，
+                # 不算整季看完，保持在看。
+                ended = getattr(reader, "is_series_ended", None)
+                continuing = callable(ended) and ended(series_id) is False
+                step["series_ended"] = (not continuing) if callable(ended) else None
+                if played_true < len(state) or continuing:
                     unfinished = [index for index, value in sorted(state.items()) if not value]
                     step["unfinished"] = unfinished[:20]
-                    step["result"] = f"未看完 {len(unfinished)} 集，保持在看"
+                    if continuing and not unfinished:
+                        step["result"] = "剧集仍在连载，即使当前集看完也记为在看"
+                    # 已标「看过」但实际未看完 —— 属误标（如剧集正在更新时
+                    # 把「当前最大集号」误当末集），应降回「在看」并同步豆瓣。
+                    if record.get("status") == "collect":
+                        reason = (f"剧集仍在连载" if continuing
+                                  else f"还有 {len(unfinished)} 集未看完")
+                        if client.set_status(subject_id=subject_id,
+                                             status="do", private=self._private):
+                            corrections[key] = record
+                            summary["corrected"] += 1
+                            step["result"] = f"误标校正：{reason}，降回在看"
+                            logger.info(f"{title} 第{season}季{reason}，误标已校正为在看")
+                        else:
+                            step["result"] = f"{reason}，但写入豆瓣失败"
+                            summary["failed"] += 1
+                        continue
+                    step["result"] = ("剧集仍在连载，保持在看" if continuing
+                                      else f"未看完 {len(unfinished)} 集，保持在看")
+                    summary["skipped"] += 1
+                    continue
+
+                # 整季确实看完了，但档案已标「看过」，无需重复写豆瓣
+                if record.get("status") == "collect":
+                    step["result"] = "整季已看完且已是看过，无需变更"
                     summary["skipped"] += 1
                     continue
 
@@ -584,16 +610,23 @@ class DoubanArchive(_PluginBase):
         except Exception as error:
             logger.debug(f"清除重扫开关失败：{error}")
 
-        if updates:
+        if updates or corrections:
             with self._lock:
                 current = dict(self.get_data(_KEY_ARCHIVE) or {})
+                stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                 for key in updates:
                     if key not in current:
                         continue
                     current[key]["status"] = "collect"
-                    current[key]["timestamp"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    current[key]["timestamp"] = stamp
+                for key in corrections:
+                    if key not in current:
+                        continue
+                    current[key]["status"] = "do"
+                    current[key]["timestamp"] = stamp
                 self.save_data(_KEY_ARCHIVE, current)
-            logger.info(f"重扫完成：{summary['upgraded']} 条升级为看过")
+            logger.info(f"重扫完成：{summary['upgraded']} 条升级为看过，"
+                        f"{summary['corrected']} 条校正为在看")
         else:
             logger.info("重扫完成：没有需要升级的条目")
 
@@ -748,18 +781,49 @@ class DoubanArchive(_PluginBase):
             # 播放状态按用户隔离，汇总所有配置用户：任一看完即算看完
             played = self._is_played_by_any_user(series_id, season, episode_no)
             if played is True:
-                return "collect"
+                # 看完一集不等于看完整季。这里要区分两种「末集」：
+                # - 剧集已完结（Status=Ended）：看完最大集号确实等于整季看完
+                # - 剧集仍在连载：最大集号只是「目前更新到的位置」，
+                #   后面还会持续增加，标「看过」是误判。
+                if self._season_watchable(reader, series_id, season, episode_no):
+                    return "collect"
+                logger.debug(
+                    f"{payload.get('title')} S{season}E{episode_no} 已播放但该季仍在更新，"
+                    f"按在看处理")
+                return "do"
             if played is False:
                 # 媒体服务器明确记录了「未看完」，且不是末集，直接判定在看
                 return "do"
 
-        if series_id and episode_no and self._is_last_episode(reader, series_id, season, episode_no):
+        if series_id and episode_no and self._season_watchable(
+                reader, series_id, season, episode_no):
             return "collect"
 
         logger.debug(
             f"{payload.get('title')} S{season}E{episode_no} 未能确认为末集，"
             f"按在看处理")
         return "do"
+
+    @staticmethod
+    def _season_watchable(reader: MediaServerReader, series_id: str,
+                          season: int, episode: int) -> bool:
+        """
+        判断「看完该集」是否可以视为「看完整季」。
+
+        条件一：该集必须是当前最大集号（否则只是看了中间某集）；
+        条件二：剧集不能处于连载状态——连载剧的最大集号只是更新到的位置，
+        后面还会加集，此时标「看过」是误判（这是「正在更新的剧集」
+        被误标的主因）。
+
+        连载状态读不到时（None）不做额外限制，维持原有行为，避免
+        因元数据缺失导致该升的没升。
+        """
+        if not DoubanArchive._is_last_episode(reader, series_id, season, episode):
+            return False
+        ended = getattr(reader, "is_series_ended", None)
+        if not callable(ended):
+            return True
+        return ended(series_id) is not False
 
     @staticmethod
     def _is_last_episode(reader: MediaServerReader, series_id: str,
