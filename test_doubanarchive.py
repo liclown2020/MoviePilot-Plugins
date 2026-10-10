@@ -541,41 +541,6 @@ def test_rescan_partial(DoubanArchive):
     return "保持在看"
 
 
-@case("重扫：已是看过的条目跳过，不降级")
-def test_rescan_skip_collect(DoubanArchive):
-    plugin = DoubanArchive()
-    plugin._enabled = True
-    plugin._cookie = "ck=x"
-    plugin.save_data("archive", {
-        "某剧_S1": {"title": "某剧", "subject_name": "某剧", "subject_id": "1",
-                    "season": 1, "episode": 10, "type": "电视剧", "status": "collect"},
-    })
-
-    class _R:
-        def search_series(self, title, season=0):
-            raise AssertionError("已是看过的条目不应再查媒体服务器")
-
-    class _C:
-        def has_login(self):
-            return True
-
-        def set_status(self, *a, **k):
-            raise AssertionError("已是看过的不应重写")
-
-    import doubanarchive as mod
-    orig_reader, orig_client = plugin._reader, mod.DoubanClient
-    plugin._reader = lambda *a, **k: _R()
-    mod.DoubanClient = lambda *a, **k: _C()
-    try:
-        result = plugin.rescan_archive()
-    finally:
-        plugin._reader, mod.DoubanClient = orig_reader, orig_client
-
-    assert result["skipped"] == 1, result
-    assert result["upgraded"] == 0, result
-    return "skipped"
-
-
 @case("重扫：电影不参与重扫")
 def test_rescan_skip_movie(DoubanArchive):
     plugin = DoubanArchive()
@@ -1096,6 +1061,160 @@ def test_diagnose_split(DoubanArchive):
     assert "login_flag" in detail["missing_search_keys"], detail
     assert detail["hint"], detail
     return f"可写={detail['can_write']} 可搜索={detail['can_search']}"
+
+
+
+@case("重扫：整季看完的已看过条目保持不变，不重复写")
+def test_rescan_keep_collect(DoubanArchive):
+    plugin = DoubanArchive()
+    plugin._enabled = True
+    plugin._cookie = "ck=x"
+    plugin._lock = __import__("threading").Lock()
+    plugin.save_data("archive", {
+        "某剧_S1": {"title": "某剧", "subject_name": "某剧", "subject_id": "1",
+                    "season": 1, "episode": 10, "type": "电视剧", "status": "collect"},
+    })
+
+    class _R:
+        def search_series(self, title, season=0):
+            return "s1"
+
+        def get_season_episodes(self, series_id, season):
+            return list(range(1, 11))
+
+        def get_season_play_state(self, series_id, season):
+            return {i: True for i in range(1, 11)}
+
+        def is_series_ended(self, series_id):
+            return True
+
+    class _C:
+        def has_login(self):
+            return True
+
+        def set_status(self, *a, **k):
+            raise AssertionError("已是看过且确实看完，不该重写")
+
+    import doubanarchive as mod
+    orig_reader, orig_client = plugin._reader, mod.DoubanClient
+    plugin._reader = lambda *a, **k: _R()
+    mod.DoubanClient = lambda *a, **k: _C()
+    try:
+        result = plugin.rescan_archive()
+    finally:
+        plugin._reader, mod.DoubanClient = orig_reader, orig_client
+
+    assert result["upgraded"] == 0, result
+    assert result["corrected"] == 0, result
+    assert plugin.get_data("archive")["某剧_S1"]["status"] == "collect"
+    return "保持看过"
+
+
+@case("重扫：已看过但实际未看完 → 误标校正为在看")
+def test_rescan_correct_mislabeled(DoubanArchive):
+    plugin = DoubanArchive()
+    plugin._enabled = True
+    plugin._cookie = "ck=x"
+    plugin._lock = __import__("threading").Lock()
+    # 模拟「正在更新时被误标看过」：实际只看了 2 集，共 4 集
+    plugin.save_data("archive", {
+        "某剧_S1": {"title": "某剧", "subject_name": "某剧", "subject_id": "2",
+                    "season": 1, "episode": 2, "type": "电视剧", "status": "collect"},
+    })
+
+    class _R:
+        def search_series(self, title, season=0):
+            return "s2"
+
+        def get_season_episodes(self, series_id, season):
+            return [1, 2, 3, 4]
+
+        def get_season_play_state(self, series_id, season):
+            return {1: True, 2: True, 3: False, 4: False}
+
+        def is_series_ended(self, series_id):
+            return False
+
+    written = []
+
+    class _C:
+        def has_login(self):
+            return True
+
+        def set_status(self, subject_id, status="do", private=True):
+            written.append((subject_id, status))
+            return True
+
+    import doubanarchive as mod
+    orig_reader, orig_client = plugin._reader, mod.DoubanClient
+    plugin._reader = lambda *a, **k: _R()
+    mod.DoubanClient = lambda *a, **k: _C()
+    try:
+        result = plugin.rescan_archive()
+    finally:
+        plugin._reader, mod.DoubanClient = orig_reader, orig_client
+
+    assert result["corrected"] == 1, result
+    assert written == [("2", "do")], written
+    assert plugin.get_data("archive")["某剧_S1"]["status"] == "do"
+    assert "误标校正" in result["trace"][0]["result"], result["trace"]
+    return "已降回在看"
+
+
+@case("判定：正在更新时看完一集不算整季看完")
+def test_status_updating_series(DoubanArchive):
+    plugin = DoubanArchive()
+    plugin._users = ""
+    plugin._lock = __import__("threading").Lock()
+
+    class _R:
+        def get_series_id(self, item_id):
+            return "s3"
+
+        def is_episode_played(self, series_id, season, episode):
+            return True
+
+        def get_season_episodes(self, series_id, season):
+            return [1, 2]
+
+        def is_series_ended(self, series_id):
+            # 仍在连载
+            return False
+
+    reader = _R()
+    plugin._reader = lambda *a, **k: reader
+    status = plugin._resolve_status(
+        {"title": "伟大的长征", "event": "PlaybackStop"}, reader, "TV", 1, 2)
+    # 第 2 集虽已播放且是当前最大集号，但剧集连载中，不算整季看完
+    assert status == "do", status
+    return "保持在看"
+
+
+@case("判定：末集看完且非更新中 → 看过")
+def test_status_last_episode_done(DoubanArchive):
+    plugin = DoubanArchive()
+    plugin._users = ""
+    plugin._lock = __import__("threading").Lock()
+
+    class _R:
+        def get_series_id(self, item_id):
+            return "s4"
+
+        def is_episode_played(self, series_id, season, episode):
+            return True
+
+        def get_season_episodes(self, series_id, season):
+            return [1, 2, 3, 4]
+
+        def is_series_ended(self, series_id):
+            return True
+
+    reader = _R()
+    plugin._reader = lambda *a, **k: reader
+    status = plugin._resolve_status(
+        {"title": "某剧", "event": "PlaybackStop"}, reader, "TV", 1, 4)
+    assert status == "collect", status
+    return "判为看过"
 
 
 def main():
