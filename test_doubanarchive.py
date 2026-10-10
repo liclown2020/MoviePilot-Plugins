@@ -1051,47 +1051,51 @@ def test_search_no_fallback_when_found(DoubanArchive):
     return "直接返回 frodo 结果"
 
 
-@case("登录态：匿名 cookie 不算已登录")
-def test_login_anon_cookie(DoubanArchive):
+
+
+@case("写入能力：有 ck 即视为可写（实测无 login_flag 也能写成功）")
+def test_can_write_with_ck_only(DoubanArchive):
     sys.path.insert(0, r"C://Users//Li//WorkBuddy//2026-10-09-10-31-43//mp-plugins//plugins.v3")
     from doubanarchive.doubanclient import DoubanClient
-    # 未登录访问豆瓣也会下发这批统计类 cookie
-    client = DoubanClient(cookie="_ga=GA1.1.1; bid=xyz; ck=KTm4; dbcl2=\"123\"")
-    assert client.has_login() is False, "匿名 cookie 不应判为已登录"
-    return "匿名 cookie 已识别"
+    # 豆瓣写入接口认 ck，不认 login_flag/db_sid
+    client = DoubanClient(cookie="ck=KTm4; _ga=x; bid=y")
+    assert client.has_login() is True, "有 ck 就应判为可写"
+    assert client.can_search() is False, "缺 login_flag 搜不到条目"
+    return "可写但不可搜索"
 
 
-@case("登录态：缺少 login_flag 或 db_sid 即未登录")
-def test_login_missing_keys(DoubanArchive):
+@case("写入能力：无 ck 则不可写")
+def test_cannot_write_without_ck(DoubanArchive):
     sys.path.insert(0, r"C://Users//Li//WorkBuddy//2026-10-09-10-31-43//mp-plugins//plugins.v3")
     from doubanarchive.doubanclient import DoubanClient
-    assert DoubanClient(cookie="login_flag=x; _ga=y").has_login() is False
-    assert DoubanClient(cookie="db_sid=y; _ga=x").has_login() is False
-    return "缺任一关键项即未登录"
+    client = DoubanClient(cookie="login_flag=x; db_sid=y; _ga=z")
+    assert client.has_login() is False, "缺 ck 无法写入"
+    assert client.can_search() is True, "有 login_flag+db_sid 应判为可搜索"
+    return "可搜索但不可写"
 
 
-@case("登录态：含 login_flag 与 db_sid 视为已登录")
-def test_login_ok(DoubanArchive):
+@case("写入能力：cookie 为空时两者都不行")
+def test_no_cookie(DoubanArchive):
     sys.path.insert(0, r"C://Users//Li//WorkBuddy//2026-10-09-10-31-43//mp-plugins//plugins.v3")
     from doubanarchive.doubanclient import DoubanClient
-    client = DoubanClient(cookie="login_flag=x; db_sid=y; UE=z; _ga=w")
-    assert client.has_login() is True
-    return "已登录"
+    client = DoubanClient(cookie="")
+    assert client.has_login() is False
+    assert client.can_search() is False
+    return "无 cookie"
 
 
-@case("登录诊断：报出缺失项与实测搜索结果")
-def test_login_diagnose(DoubanArchive):
+@case("cookie 诊断：分开报告可写与可搜索")
+def test_diagnose_split(DoubanArchive):
     sys.path.insert(0, r"C://Users//Li//WorkBuddy//2026-10-09-10-31-43//mp-plugins//plugins.v3")
     from doubanarchive.doubanclient import DoubanClient
-    client = DoubanClient(cookie="_ga=1; bid=2")
-    client.search = lambda title, media_type: (None, None)
+    client = DoubanClient(cookie="ck=KTm4; _ga=1; bid=2")
     detail = client.diagnose_login()
-    assert detail["logged_in"] is False, detail
-    assert "login_flag" in detail["missing_keys"], detail
-    assert "db_sid" in detail["missing_keys"], detail
-    assert detail["probe_ok"] is False, detail
+    assert detail["can_write"] is True, detail
+    assert detail["has_ck"] is True, detail
+    assert detail["can_search"] is False, detail
+    assert "login_flag" in detail["missing_search_keys"], detail
     assert detail["hint"], detail
-    return f"缺 {detail['missing_keys']}"
+    return f"可写={detail['can_write']} 可搜索={detail['can_search']}"
 
 
 def main():
