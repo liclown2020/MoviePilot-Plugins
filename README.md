@@ -4,7 +4,7 @@
 
 | 插件 | 类名 / 目录 | 版本 | 作者 | 来源 |
 | --- | --- | --- | --- | --- |
-| 豆瓣档案同步 | `DoubanArchive` / `plugins.v3/doubanarchive` | 1.6.0 | liclown2020 | 本仓库原创 |
+| 豆瓣档案同步 | `DoubanArchive` / `plugins.v3/doubanarchive` | 1.7.1 | liclown2020 |  改编 |
 | 缺失集数订阅V3版 | `EpisodeNoExistV3` / `plugins.v3/episodenoexistv3` | 1.0.2 | boeto / liclown2020 | 改编自 [boeto/MoviePilot-Plugins](https://github.com/boeto/MoviePilot-Plugins) 的「缺失集数订阅」0.0.8 |
 
 ---
