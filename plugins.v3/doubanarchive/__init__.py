@@ -65,7 +65,7 @@ class DoubanArchive(_PluginBase):
     plugin_name = "豆瓣档案同步"
     plugin_desc = "将在看、看完状态同步到豆瓣书影音档案，不依赖 TMDB 识别，失败自动重试。"
     plugin_icon = "Douban_A.png"
-    plugin_version = "1.7.0"
+    plugin_version = "1.7.1"
     plugin_author = "liclown2020"
     author_url = "https://github.com/liclown2020"
     plugin_config_prefix = "doubanarchive_"
@@ -394,7 +394,7 @@ class DoubanArchive(_PluginBase):
         status = self._resolve_status(payload, reader, media_type, season, episode)
         client = DoubanClient(cookie=self._load_cookie())
         if not client.has_login():
-            logger.error("豆瓣 cookie 为空，无法同步，请配置 cookie 或 CookieCloud")
+            logger.error("豆瓣 cookie 缺少 ck，无法写入档案，请重新配置 cookie")
             self._save_pending(key, payload, subject_name or title, season, media_type, status, subject_id)
             return
 
@@ -430,7 +430,7 @@ class DoubanArchive(_PluginBase):
         logger.info(f"开始重试豆瓣同步失败队列，共 {len(pending)} 条")
         client = DoubanClient(cookie=self._load_cookie())
         if not client.has_login():
-            logger.error("豆瓣 cookie 为空，跳过本次重试")
+            logger.error("豆瓣 cookie 缺少 ck，跳过本次重试")
             return
 
         for key, record in pending.items():
@@ -483,11 +483,9 @@ class DoubanArchive(_PluginBase):
 
         client = DoubanClient(cookie=self._load_cookie())
         if not client.has_login():
-            detail = client.diagnose_login()
-            logger.error(f"豆瓣未登录，无法重扫档案：缺少 {detail['missing_keys']}")
+            logger.error("豆瓣 cookie 缺少 ck，无法重扫档案")
             summary["failed"] = len(archive)
-            summary["trace"] = [{"result":
-                "豆瓣未登录，cookie 缺少 " + "、".join(detail["missing_keys"])}]
+            summary["trace"] = [{"result": "豆瓣 cookie 缺少 ck，无法写入"}]
             return summary
 
         reader = self._reader()
