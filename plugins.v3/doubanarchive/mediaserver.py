@@ -83,6 +83,36 @@ class MediaServerReader:
                 return douban_id
         return None
 
+    def is_series_ended(self, series_id: str) -> Optional[bool]:
+        """
+        读取剧集的完结状态。
+
+        返回 True 表示已完结，False 表示仍在连载，None 表示读不到。
+        连载中的剧即使当前最大集号已看完，也只是「看到了已更新的部分」，
+        不能当作整季看完——这是「正在更新」场景误判为看过的主因。
+        """
+        if not series_id:
+            return None
+        instance, server_type = self._locate()
+        if not instance:
+            return None
+
+        cache_key = (server_type, f"ended-{series_id}")
+        if cache_key in self._cache:
+            return self._cache[cache_key]
+
+        item = self.get_item(series_id)
+        result: Optional[bool] = None
+        if isinstance(item, dict):
+            status = str(item.get("Status") or "").strip().lower()
+            if status == "ended":
+                result = True
+            elif status in ("continuing", "canceled", "ended"):
+                # canceled 表示已取消，不再有新集，按完结处理
+                result = False
+        self._cache[cache_key] = result
+        return result
+
     def get_series_id(self, item_id: str) -> Optional[str]:
         """
         解析条目所属剧集的 ID。
