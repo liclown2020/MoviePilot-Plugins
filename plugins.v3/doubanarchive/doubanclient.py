@@ -5,7 +5,7 @@ from __future__ import annotations
 import base64
 import json
 from http.cookies import SimpleCookie
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Optional, Set, Tuple
 
 from app.sdk.logging import logger
 from app.sdk.network import RequestUtils
@@ -45,40 +45,53 @@ class DoubanClient:
 
     def has_login(self) -> bool:
         """
-        判断当前 cookie 是否为已登录状态。
+        判断当前 cookie 是否具备写入豆瓣书影音档案的能力。
 
-        仅判断 cookie 非空是不够的：未登录访问豆瓣也会拿到一批
-        统计类 cookie（_ga、__utm*、ck、bid 等），它们不含任何登录凭证，
-        用这样的 cookie 请求豆瓣接口只会得到空结果。
-        这里检查关键登录凭证是否齐全。
+        判据是「有 ck」而非「有 login_flag」：写入接口
+        `j/subject/{id}/interest` 认的是 ck（antispam 凭证），
+        没有 login_flag、db_sid 一样能写成功（实测返回 {"r":0}）。
+        login_flag / db_sid 只影响网页搜索，缺它们只是搜不到条目，
+        不影响写入，所以不能拿它们当登录判据。
+        """
+        if not self.cookies:
+            return False
+        return "ck" in self._cookie_keys()
+
+    def _cookie_keys(self) -> Set[str]:
+        """返回当前 cookie 的键名集合。"""
+        return {item.split("=", 1)[0].strip() for item in self.cookie_header().split(";")}
+
+    def can_search(self) -> bool:
+        """
+        判断当前 cookie 是否能用于豆瓣搜索。
+
+        搜索接口（网页搜索与 subject_abstract）要求 login_flag、db_sid，
+        缺任一则返回空结果。写入不依赖这些，所以与 has_login 分开判断。
         """
         if not self.cookies:
             return False
         required = ("login_flag", "db_sid")
-        present = {item.split("=", 1)[0].strip() for item in self.cookie_header().split(";")}
-        return all(key in present for key in required)
+        keys = self._cookie_keys()
+        return all(key in keys for key in required)
 
     def diagnose_login(self) -> Dict[str, Any]:
         """
-        诊断 cookie 的登录状态，返回缺失项与实测搜索结果。
+        诊断 cookie 状态，分别报告「能否写入」与「能否搜索」。
 
-        排查「扫描一直失败」时，先看这个接口：cookie 非空不代表已登录，
-        未登录时豆瓣搜索返回空，最终表现为写入时 404。
+        两者条件不同：写入认 ck，搜索认 login_flag + db_sid。
+        排查时先看 can_write，写入正常但 imported=0 就要看 can_search。
         """
-        present = {item.split("=", 1)[0].strip() for item in self.cookie_header().split(";")}
-        required = ("login_flag", "db_sid", "UE")
-        missing = [key for key in required if key not in present]
-
-        probe_name, probe_id = self.search("老舅", "TV")
+        keys = self._cookie_keys()
+        search_required = ("login_flag", "db_sid")
+        missing = [key for key in search_required if key not in keys]
         return {
-            "cookie_count": len(present),
-            "logged_in": not missing,
-            "missing_keys": missing,
-            "probe_title": probe_name,
-            "probe_subject_id": probe_id,
-            "probe_ok": bool(probe_id),
-            "hint": "cookie 中缺少登录凭证，需从已登录的浏览器重新复制"
-                    if missing else "",
+            "cookie_count": len(keys),
+            "can_write": self.has_login(),
+            "has_ck": "ck" in keys,
+            "can_search": not missing,
+            "missing_search_keys": missing,
+            "hint": "写入正常；缺 " + "、".join(missing) + "，豆瓣搜索不可用，"
+                    "新条目需依赖媒体服务器刮削的豆瓣 ID" if missing else "",
         }
 
     def search(self, title: str, media_type: str = "TV") -> Tuple[Optional[str], Optional[str]]:
