@@ -65,7 +65,7 @@ class DoubanArchive(_PluginBase):
     plugin_name = "豆瓣档案同步"
     plugin_desc = "将在看、看完状态同步到豆瓣书影音档案，不依赖 TMDB 识别，失败自动重试。"
     plugin_icon = "Douban_A.png"
-    plugin_version = "1.7.2"
+    plugin_version = "1.7.3"
     plugin_author = "liclown2020"
     author_url = "https://github.com/liclown2020"
     plugin_config_prefix = "doubanarchive_"
@@ -374,11 +374,6 @@ class DoubanArchive(_PluginBase):
         with self._lock:
             archive = self.get_data(_KEY_ARCHIVE) or {}
             record = archive.get(key)
-            # 已经是「看过」就不再重复写入，但仍在看时允许升级为看过
-            if isinstance(record, dict) and record.get("status") == "collect" \
-                    and status != "collect":
-                logger.info(f"{self._display_title(title, season)} 已标记为看完，跳过")
-                return
 
         reader = self._reader(payload.get("server_name"))
         subject_id = payload.get("subject_id") or reader.get_douban_id(payload.get("item_id") or "")
@@ -392,6 +387,16 @@ class DoubanArchive(_PluginBase):
             return
 
         status = self._resolve_status(payload, reader, media_type, season, episode)
+
+        # 已经是「看过」就不再重复写入，但仍在看时允许升级为看过。
+        # 该判断必须放在 status 算出之后 —— 早先放在前面引用了尚未
+        # 赋值的 status，导致任何「档案已有该条目」的同步都抛
+        # UnboundLocalError。
+        if isinstance(record, dict) and record.get("status") == "collect" \
+                and status != "collect":
+            logger.info(f"{self._display_title(title, season)} 已标记为看完，跳过")
+            return
+
         client = DoubanClient(cookie=self._load_cookie())
         if not client.has_login():
             logger.error("豆瓣 cookie 缺少 ck，无法写入档案，请重新配置 cookie")
