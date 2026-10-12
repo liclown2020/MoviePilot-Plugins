@@ -1217,6 +1217,120 @@ def test_status_last_episode_done(DoubanArchive):
     return "判为看过"
 
 
+
+@case("同步：档案已有该条目时不会引用未赋值的 status")
+def test_sync_existing_record_no_unbound(DoubanArchive):
+    """回归测试：v1.3.0 引入的判断放在 status 赋值之前，导致同步必崩。"""
+    import doubanarchive as mod
+
+    plugin = DoubanArchive()
+    plugin._enabled = True
+    plugin._cookie = "ck=x"
+    plugin._private = False
+    plugin._lock = __import__("threading").Lock()
+    # 关键：档案里已有该条目 —— 这正是触发崩溃的路径
+    plugin.save_data("archive", {
+        "某剧_S1": {"title": "某剧", "subject_name": "某剧", "subject_id": "9",
+                    "season": 1, "episode": 5, "type": "电视剧", "status": "collect"},
+    })
+
+    class _R:
+        def get_douban_id(self, item_id):
+            return "9"
+
+        def get_series_id(self, item_id):
+            return "s9"
+
+        def is_episode_played(self, series_id, season, episode):
+            return False
+
+        def get_season_episodes(self, series_id, season):
+            return list(range(1, 21))
+
+        def is_series_ended(self, series_id):
+            return True
+
+    class _C:
+        def has_login(self):
+            return True
+
+        def set_status(self, *a, **k):
+            raise AssertionError("已是看过且本次仍判在看，不该写豆瓣")
+
+        def get_subject_image(self, subject_id, media_type):
+            return ""
+
+    orig_reader, orig_client = plugin._reader, mod.DoubanClient
+    plugin._reader = lambda *a, **k: _R()
+    mod.DoubanClient = lambda *a, **k: _C()
+    try:
+        # 修复前这里会抛 UnboundLocalError: local variable 'status'
+        plugin._sync_item({"title": "某剧", "media_type": "TV", "season": 1,
+                           "episode": 5, "subject_id": "9"})
+    finally:
+        plugin._reader, mod.DoubanClient = orig_reader, orig_client
+
+    assert plugin.get_data("archive")["某剧_S1"]["status"] == "collect", "状态不应改变"
+    return "正常跳过，无异常"
+
+
+@case("同步：档案已有条目但在看时仍可升级为看过")
+def test_sync_upgrade_from_watching(DoubanArchive):
+    import doubanarchive as mod
+
+    plugin = DoubanArchive()
+    plugin._enabled = True
+    plugin._cookie = "ck=x"
+    plugin._private = False
+    plugin._lock = __import__("threading").Lock()
+    plugin.save_data("archive", {
+        "某剧_S1": {"title": "某剧", "subject_name": "某剧", "subject_id": "9",
+                    "season": 1, "episode": 5, "type": "电视剧", "status": "do"},
+    })
+
+    class _R:
+        def get_douban_id(self, item_id):
+            return "9"
+
+        def get_series_id(self, item_id):
+            return "s9"
+
+        def is_episode_played(self, series_id, season, episode):
+            return True
+
+        def get_season_episodes(self, series_id, season):
+            return list(range(1, 21))
+
+        def is_series_ended(self, series_id):
+            return True
+
+    written = []
+
+    class _C:
+        def has_login(self):
+            return True
+
+        def set_status(self, subject_id, status="do", private=True):
+            written.append((subject_id, status))
+            return True
+
+        def get_subject_image(self, subject_id, media_type):
+            return ""
+
+    orig_reader, orig_client = plugin._reader, mod.DoubanClient
+    plugin._reader = lambda *a, **k: _R()
+    mod.DoubanClient = lambda *a, **k: _C()
+    try:
+        plugin._sync_item({"title": "某剧", "media_type": "TV", "season": 1,
+                           "episode": 20, "subject_id": "9"})
+    finally:
+        plugin._reader, mod.DoubanClient = orig_reader, orig_client
+
+    assert written == [("9", "collect")], written
+    assert plugin.get_data("archive")["某剧_S1"]["status"] == "collect"
+    return "已升级为看过"
+
+
 def main():
     DoubanArchive = load_plugin_base()
     print("=" * 62)
