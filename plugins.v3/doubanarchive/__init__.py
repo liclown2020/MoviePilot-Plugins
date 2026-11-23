@@ -8,12 +8,36 @@
 """
 from __future__ import annotations
 
+import base64
+import hashlib
+import hmac
 import re
+import secrets
 import threading
+import time
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
 from apscheduler.triggers.cron import CronTrigger
+
+try:  # 宿主提供 FastAPI；独立测试环境可能没有，降级为最小替身
+    from fastapi import HTTPException, Query, Response
+except Exception:  # pragma: no cover - 测试环境兜底
+    class HTTPException(Exception):  # type: ignore
+        def __init__(self, status_code: int = 500, detail: str = ""):
+            super().__init__(detail)
+            self.status_code = status_code
+            self.detail = detail
+
+    def Query(default: Any = None, description: str = "") -> Any:  # type: ignore
+        return default
+
+    class Response:  # type: ignore
+        def __init__(self, content: bytes = b"", media_type: str = "",
+                     headers: Optional[Dict[str, str]] = None):
+            self.content = content
+            self.media_type = media_type
+            self.headers = headers or {}
 
 from app.schemas import WebhookEventInfo
 from app.schemas.types import EventType
@@ -52,10 +76,15 @@ _KEY_DASHBOARD = "archive"
 _KEY_DIAG = "diagnose"
 # 豆瓣图片 data URI 缓存键（避免每次刷新都回源）
 _KEY_IMAGES = "images"
-# 单次渲染最多回源几张图，避免仪表盘请求太久
-_INLINE_BUDGET = 8
+# 图片代理签名密钥的存储键（首次使用时随机生成并持久化）
+_KEY_IMAGE_SECRET = "image_secret"
+# 图片代理 URL 的有效期（秒）。签名过期后前端会重新拉取仪表盘，
+# 由插件重新签发新链接，不会出现图片突然失效。
+_IMAGE_URL_TTL = 7 * 24 * 3600
 # 图片缓存最多保留多少张
 _IMAGE_CACHE_MAX = 200
+# 单次渲染最多回源几张图，避免仪表盘请求太久
+_INLINE_BUDGET = 8
 
 
 class DoubanArchive(_PluginBase):
@@ -65,7 +94,7 @@ class DoubanArchive(_PluginBase):
     plugin_name = "豆瓣档案同步"
     plugin_desc = "将在看、看完状态同步到豆瓣书影音档案，不依赖 TMDB 识别，失败自动重试。"
     plugin_icon = "Douban_A.png"
-    plugin_version = "1.7.4"
+    plugin_version = "1.8.0"
     plugin_author = "liclown2020"
     author_url = "https://github.com/liclown2020"
     plugin_config_prefix = "doubanarchive_"
@@ -216,7 +245,85 @@ class DoubanArchive(_PluginBase):
                 "auth": "bear",
                 "summary": "诊断豆瓣 cookie 登录状态",
             },
+            {
+                "path": "/image",
+                "endpoint": self.api_proxy_image,
+                "methods": ["GET"],
+                "summary": "图片代理：带签名取回封面，绕开豆瓣防盗链",
+                # 前端 <img> 无法附带自定义请求头，因此这个端点必须允许匿名访问；
+                # 为避免被当作开放代理使用，URL 里带 HMAC 签名与有效期。
+                "allow_anonymous": True,
+            },
         ]
+
+    # ---------------- 图片代理 ----------------
+
+    def _image_secret(self) -> bytes:
+        """取图片代理的签名密钥，没有则生成并持久化。"""
+        with self._lock:
+            secret = self.get_data(_KEY_IMAGE_SECRET)
+            if not secret:
+                secret = secrets.token_hex(32)
+                self.save_data(_KEY_IMAGE_SECRET, secret)
+            return str(secret).encode("utf-8")
+
+    def _sign_image_url(self, url: str) -> str:
+        """
+        为图片地址生成带签名的代理链接。
+
+        签名内容包含原始地址与过期时间戳，密钥不外泄，
+        因此只有本插件签发的链接能通过校验，外部无法伪造任意地址来代理。
+
+        链接用相对路径（api/v1/...），与 MP 前端自身的资源引用方式一致
+        （`./assets/...`），挂在子路径下也能正确解析。
+        """
+        expires = int(time.time()) + _IMAGE_URL_TTL
+        payload = f"{url}|{expires}".encode("utf-8")
+        signature = hmac.new(self._image_secret(), payload, hashlib.sha256).hexdigest()[:32]
+        encoded = base64.urlsafe_b64encode(url.encode("utf-8")).decode("ascii").rstrip("=")
+        return f"api/v1/plugin/DoubanArchive/image?u={encoded}&e={expires}&s={signature}"
+
+    def _verify_image_signature(self, url: str, expires: int, signature: str) -> bool:
+        """校验图片代理链接的签名与有效期。"""
+        if expires < int(time.time()):
+            return False
+        payload = f"{url}|{expires}".encode("utf-8")
+        expected = hmac.new(self._image_secret(), payload, hashlib.sha256).hexdigest()[:32]
+        return hmac.compare_digest(expected, signature or "")
+
+    def api_proxy_image(self, u: str = Query("", description="图片地址的 base64 编码"),
+                        e: int = Query(0, description="过期时间戳"),
+                        s: str = Query("", description="签名")) -> Response:
+        """
+        图片代理端点。
+
+        豆瓣图片有防盗链，浏览器直接请求会拿到 418 与十几字节的占位图；
+        媒体服务器自己的图片也可能需要鉴权头。这里由后端带齐请求头取回真图，
+        前端只管 <img src>，不再受防盗链与体积限制影响。
+        """
+        try:
+            padding = "=" * (-len(u) % 4)
+            url = base64.urlsafe_b64decode(u + padding).decode("utf-8")
+        except Exception:
+            raise HTTPException(status_code=400, detail="图片地址无法解析")
+
+        if not url.startswith(("http://", "https://")):
+            raise HTTPException(status_code=400, detail="图片地址不合法")
+        if not self._verify_image_signature(url, e, s):
+            raise HTTPException(status_code=403, detail="签名无效或已过期")
+
+        result = DoubanClient(cookie=self._load_cookie()).fetch_image_bytes(url)
+        if not result:
+            raise HTTPException(status_code=404, detail="图片获取失败")
+        content, content_type = result
+        return Response(
+            content=content,
+            media_type=content_type,
+            headers={
+                "Cache-Control": f"public, max-age={_IMAGE_URL_TTL}",
+                "Content-Length": str(len(content)),
+            },
+        )
 
     def api_login_check(self) -> Dict[str, Any]:
         """返回豆瓣 cookie 的登录状态诊断结果。"""
@@ -420,6 +527,15 @@ class DoubanArchive(_PluginBase):
         """重试待处理队列中的条目，成功后移出队列，并顺带补齐缺失的海报。"""
         if not self._enabled:
             return
+
+        # 图片已改为代理加载，旧的 data URI 缓存不再使用，且体积可观，
+        # 这里清掉以免一直占着插件存储。
+        try:
+            if self.get_data(_KEY_IMAGES):
+                self.save_data(_KEY_IMAGES, {})
+                logger.info("已清理旧版图片内联缓存")
+        except Exception as error:
+            logger.debug(f"清理图片缓存失败：{error}")
 
         # 仪表盘海报墙依赖封面图，历史缺图条目在这里慢慢补齐
         try:
@@ -1405,7 +1521,8 @@ class DoubanArchive(_PluginBase):
                                 "props": {"cols": 12, "md": 6},
                                 "content": [
                                     {"component": "VSwitch",
-                                     "props": {"model": "inline_image", "label": "内联豆瓣图片（防盗链）"}}
+                                     "props": {"model": "inline_image",
+                                               "label": "通过插件代理加载封面（绕开防盗链）"}}
                                 ],
                             },
                             {
@@ -1643,51 +1760,35 @@ class DoubanArchive(_PluginBase):
             return None
 
     def _prepare_images(self) -> None:
-        """渲染前准备好图片缓存，并为本次渲染分配回源预算。"""
-        if not self._image_map:
-            self._image_map = dict(self.get_data(_KEY_IMAGES) or {})
-        self._image_cache = self._image_map
+        """渲染前准备图片代理状态。"""
         self._image_budget = _INLINE_BUDGET
         self._image_dirty = False
 
     def _flush_images(self) -> None:
-        """渲染结束后把新增的 data URI 落盘，下次直接使用。"""
-        if not self._image_dirty:
-            return
-        mapping = dict(self._image_map)
-        # 超量时丢掉最早写入的一批，避免缓存无限增长
-        if len(mapping) > _IMAGE_CACHE_MAX:
-            for key in list(mapping.keys())[:len(mapping) - _IMAGE_CACHE_MAX]:
-                mapping.pop(key, None)
-        self.save_data(_KEY_IMAGES, mapping)
-        self._image_dirty = False
+        """图片代理方案下无需维护本地缓存，保留此方法以兼容旧调用。"""
+        return
 
     def _resolve_image(self, record: Dict[str, Any]) -> str:
         """
         返回可直接展示的图片地址。
-        豆瓣图片有防盗链（带本站 Referer 会 403），因此由后端取回后内联为 data URI。
+
+        所有封面都走本插件的图片代理：
+        - 豆瓣图片有防盗链，浏览器直连只会拿到 418 与占位图；
+        - 媒体服务器自己的图片（Emby 的 Items/.../Images）需要鉴权头，
+          前端直连同样拿不到。
+
+        代理链接带 HMAC 签名，既保证图片一定显示，也避免被当作开放代理。
         """
         image = str(record.get("image") or "")
-        if not image or "doubanio.com" not in image:
+        if not image:
+            return ""
+        if not image.startswith(("http://", "https://")):
             return image
-
-        cached = self._image_map.get(image)
-        if cached:
-            return cached
-        if not self._inline_image or image in self._image_failed:
-            return ""
-        if len(self._image_map) >= self._inline_limit or self._image_budget <= 0:
-            # 超出上限或本次预算用尽，先占位，后续刷新继续补齐
-            return ""
-
-        self._image_budget -= 1
-        uri = DoubanClient().fetch_image_data_uri(image)
-        if not uri:
-            self._image_failed.add(image)
-            return ""
-        self._image_map[image] = uri
-        self._image_dirty = True
-        return uri
+        if not self._inline_image:
+            # 关闭代理时退回原始地址。豆瓣图会因防盗链显示不出来，
+            # 但这是用户的明确选择。
+            return image
+        return self._sign_image_url(image)
 
     def _build_card(self, record: Dict[str, Any], mobile: bool) -> Optional[Dict[str, Any]]:
         """把一条档案记录渲染成海报卡片；没有豆瓣条目就无处跳转，直接跳过。"""
