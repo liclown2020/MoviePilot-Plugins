@@ -1467,6 +1467,93 @@ def test_rescalibrate_no_change(DoubanArchive):
     return "未改动"
 
 
+
+@case("图片代理：签名 URL 生成与校验")
+def test_image_proxy_signature(DoubanArchive):
+    import base64
+    plugin = DoubanArchive()
+    plugin._lock = __import__("threading").Lock()
+    plugin.save_data("image_secret", "testsecret")
+
+    url = "https://img3.doubanio.com/view/photo/m_ratio_poster/public/p123.webp"
+    signed = plugin._sign_image_url(url)
+    # 相对路径：挂在子路径下也能正确解析（与 MP 前端 ./assets/... 同理）
+    assert signed.startswith("api/v1/plugin/DoubanArchive/image?"), signed
+    assert "u=" in signed and "e=" in signed and "s=" in signed, signed
+
+    # 解出参数并校验签名
+    from urllib.parse import parse_qs, urlparse
+    query = parse_qs(urlparse(signed).query)
+    decoded = base64.urlsafe_b64decode(query["u"][0] + "=" * (-len(query["u"][0]) % 4)).decode()
+    assert decoded == url, decoded
+    assert plugin._verify_image_signature(decoded, int(query["e"][0]), query["s"][0]) is True
+
+    # 篡改地址必须验不过
+    assert plugin._verify_image_signature("https://evil.example.com/x.jpg",
+                                         int(query["e"][0]), query["s"][0]) is False
+    # 错误签名也必须验不过
+    assert plugin._verify_image_signature(decoded, int(query["e"][0]), "bad" * 8) is False
+    return "签名可验证，篡改被拒"
+
+
+@case("图片代理：过期链接被拒")
+def test_image_proxy_expired(DoubanArchive):
+    plugin = DoubanArchive()
+    plugin._lock = __import__("threading").Lock()
+    plugin.save_data("image_secret", "testsecret")
+    url = "https://img3.doubanio.com/x.webp"
+    signed = plugin._sign_image_url(url)
+    from urllib.parse import parse_qs, urlparse
+    query = parse_qs(urlparse(signed).query)
+    expired = int(query["e"][0]) - 1
+    assert plugin._verify_image_signature(url, expired, query["s"][0]) is False
+    return "过期被拒"
+
+
+@case("图片代理：所有封面都返回代理链接，不受数量限制")
+def test_image_proxy_all_images(DoubanArchive):
+    plugin = DoubanArchive()
+    plugin._lock = __import__("threading").Lock()
+    plugin.save_data("image_secret", "testsecret")
+    plugin._inline_image = True
+
+    # 34 条以上，验证不再有「超出上限就返回空」的截断
+    records = [{"image": f"https://img3.doubanio.com/view/photo/m_ratio_poster/public/p{i}.webp"}
+               for i in range(40)]
+    records.append({"image": "https://emby.liyawei.top:434/Items/1/Images/Backdrop"})
+
+    results = [plugin._resolve_image(r) for r in records]
+    empty = [i for i, r in enumerate(results) if not r]
+    assert not empty, f"{len(empty)} 条返回空: {empty[:5]}"
+    for r in results:
+        assert r.startswith("api/v1/plugin/DoubanArchive/image?"), r[:60]
+    return f"{len(results)} 条全部有代理链接"
+
+
+@case("图片代理：关闭代理开关时退回原始地址")
+def test_image_proxy_disabled(DoubanArchive):
+    plugin = DoubanArchive()
+    plugin._lock = __import__("threading").Lock()
+    plugin.save_data("image_secret", "testsecret")
+    plugin._inline_image = False
+    url = "https://img3.doubanio.com/x.webp"
+    assert plugin._resolve_image({"image": url}) == url
+    return "已退回原始地址"
+
+
+@case("图片代理：拒绝非 http(s) 地址")
+def test_image_proxy_reject_non_http(DoubanArchive):
+    plugin = DoubanArchive()
+    plugin._lock = __import__("threading").Lock()
+    plugin.save_data("image_secret", "testsecret")
+    try:
+        plugin.api_proxy_image(u="", e=0, s="")
+        raise AssertionError("应拒绝非法地址")
+    except Exception as error:
+        assert "400" in str(error) or "不合法" in str(error) or "无法解析" in str(error), error
+    return "非法地址被拒"
+
+
 def main():
     DoubanArchive = load_plugin_base()
     print("=" * 62)
