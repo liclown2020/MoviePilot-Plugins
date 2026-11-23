@@ -65,7 +65,7 @@ class DoubanArchive(_PluginBase):
     plugin_name = "豆瓣档案同步"
     plugin_desc = "将在看、看完状态同步到豆瓣书影音档案，不依赖 TMDB 识别，失败自动重试。"
     plugin_icon = "Douban_A.png"
-    plugin_version = "1.7.3"
+    plugin_version = "1.7.4"
     plugin_author = "liclown2020"
     author_url = "https://github.com/liclown2020"
     plugin_config_prefix = "doubanarchive_"
@@ -500,6 +500,7 @@ class DoubanArchive(_PluginBase):
 
         updates: Dict[str, Dict[str, Any]] = {}
         corrections: Dict[str, Dict[str, Any]] = {}
+        calibrations: Dict[str, Dict[str, Any]] = {}
         trace: List[Dict[str, Any]] = []
         for key, record in archive.items():
             if not isinstance(record, dict):
@@ -551,6 +552,19 @@ class DoubanArchive(_PluginBase):
                 ended = getattr(reader, "is_series_ended", None)
                 continuing = callable(ended) and ended(series_id) is False
                 step["series_ended"] = (not continuing) if callable(ended) else None
+
+                # 校准 episode 字段：它原本取「最后触发事件的集号」，
+                # 与「实际已看完的最大集号」不是一回事（Emby 集数变化、
+                # 跳集时两者差异很大），档案里显示的集号应以实际为准。
+                watched_max = max(
+                    (index for index, value in state.items() if value), default=0)
+                if watched_max and watched_max != self._to_int(record.get("episode"), 0, 0):
+                    record["episode"] = watched_max
+                    step["episode_calibrated"] = watched_max
+                    # 只更新集号，不动状态 —— 走独立的 calibrations 容器，
+                    # 不能混进 updates（那边落盘时会强制置为「看过」）。
+                    calibrations[key] = record
+
                 if played_true < len(state) or continuing:
                     unfinished = [index for index, value in sorted(state.items()) if not value]
                     step["unfinished"] = unfinished[:20]
@@ -628,6 +642,12 @@ class DoubanArchive(_PluginBase):
                     if key not in current:
                         continue
                     current[key]["status"] = "do"
+                    current[key]["timestamp"] = stamp
+                # 只校准集号，状态保持原样
+                for key in calibrations:
+                    if key not in current:
+                        continue
+                    current[key]["episode"] = calibrations[key].get("episode", 0)
                     current[key]["timestamp"] = stamp
                 self.save_data(_KEY_ARCHIVE, current)
             logger.info(f"重扫完成：{summary['upgraded']} 条升级为看过，"
