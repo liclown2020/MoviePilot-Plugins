@@ -1331,6 +1331,142 @@ def test_sync_upgrade_from_watching(DoubanArchive):
     return "已升级为看过"
 
 
+
+@case("候选标题：剥离多位中文数字季数（十一/十二/二十/一百）")
+def test_candidates_cn_multi_digit(DoubanArchive):
+    sys.path.insert(0, r"C://Users//Li//WorkBuddy//2026-10-09-10-31-43//mp-plugins//plugins.v3")
+    from doubanarchive.mediaserver import MediaServerReader
+    cases = {
+        "小猪佩奇 第十一季 第11季": "小猪佩奇",
+        "小猪佩奇 第十二季 第12季": "小猪佩奇",
+        "小猪佩奇 第二十季": "小猪佩奇",
+        "小猪佩奇 第一百季": "小猪佩奇",
+        "小猪佩奇 第二十三季": "小猪佩奇",
+        "小猪佩奇 第一百二十季": "小猪佩奇",
+    }
+    for title, expect in cases.items():
+        got = MediaServerReader.build_title_candidates(title, 1)
+        assert expect in got, f"{title} → {got}"
+    return f"{len(cases)} 个多位中文数字全部剥离"
+
+
+@case("候选标题：普通剧名不被误伤")
+def test_candidates_no_false_strip(DoubanArchive):
+    sys.path.insert(0, r"C://Users//Li//WorkBuddy//2026-10-09-10-31-43//mp-plugins//plugins.v3")
+    from doubanarchive.mediaserver import MediaServerReader
+    for title in ["伟大的长征", "征途", "铁拳教育", "旺卡", "小城良方"]:
+        got = MediaServerReader.build_title_candidates(title, 1)
+        assert got[0] == title, got
+        assert title in got, got
+    return "5 个剧名未受影响"
+
+
+
+@case("重扫：校准 episode 为实际最大已播集号，状态不变")
+def test_rescan_calibrate_episode(DoubanArchive):
+    plugin = DoubanArchive()
+    plugin._enabled = True
+    plugin._cookie = "ck=x"
+    plugin._users = "a"
+    plugin._lock = __import__("threading").Lock()
+    # 档案记的是「最后触发事件集号」45，实际只看了 18 集
+    plugin.save_data("archive", {
+        "某剧_S1": {"title": "某剧", "subject_name": "某剧", "subject_id": "5",
+                    "season": 1, "episode": 45, "type": "电视剧", "status": "do"},
+    })
+
+    class _R:
+        def search_series(self, title, season=0):
+            return "s5"
+
+        def get_season_episodes(self, series_id, season):
+            return list(range(1, 25))
+
+        def get_season_play_state(self, series_id, season):
+            state = {i: True for i in range(1, 19)}
+            state.update({i: False for i in range(19, 25)})
+            return state
+
+        def is_series_ended(self, series_id):
+            return True
+
+    class _C:
+        def has_login(self):
+            return True
+
+        def set_status(self, subject_id, status="do", private=True):
+            raise AssertionError("状态本就该是「在看」，不该重写")
+
+        def get_subject_image(self, subject_id, media_type):
+            return ""
+
+    import doubanarchive as mod
+    orig_reader, orig_client = plugin._reader, mod.DoubanClient
+    plugin._reader = lambda *a, **k: _R()
+    mod.DoubanClient = lambda *a, **k: _C()
+    try:
+        result = plugin.rescan_archive()
+    finally:
+        plugin._reader, mod.DoubanClient = orig_reader, orig_client
+
+    saved = plugin.get_data("archive")["某剧_S1"]
+    assert saved["episode"] == 18, f"集号应校准为 18，实际 {saved['episode']}"
+    assert saved["status"] == "do", f"状态不应改变，实际 {saved['status']}"
+    assert result["upgraded"] == 0, result
+    assert result["corrected"] == 0, result
+    return "集号 45 → 18，状态保持在看"
+
+
+@case("重扫：集号已准确时不改动")
+def test_rescalibrate_no_change(DoubanArchive):
+    plugin = DoubanArchive()
+    plugin._enabled = True
+    plugin._cookie = "ck=x"
+    plugin._users = "a"
+    plugin._lock = __import__("threading").Lock()
+    plugin.save_data("archive", {
+        "某剧_S1": {"title": "某剧", "subject_name": "某剧", "subject_id": "5",
+                    "season": 1, "episode": 18, "type": "电视剧", "status": "do"},
+    })
+
+    class _R:
+        def search_series(self, title, season=0):
+            return "s5"
+
+        def get_season_episodes(self, series_id, season):
+            return list(range(1, 25))
+
+        def get_season_play_state(self, series_id, season):
+            state = {i: True for i in range(1, 19)}
+            state.update({i: False for i in range(19, 25)})
+            return state
+
+        def is_series_ended(self, series_id):
+            return True
+
+    class _C:
+        def has_login(self):
+            return True
+
+        def set_status(self, *a, **k):
+            raise AssertionError("集号已准确，不该重写")
+
+        def get_subject_image(self, subject_id, media_type):
+            return ""
+
+    import doubanarchive as mod
+    orig_reader, orig_client = plugin._reader, mod.DoubanClient
+    plugin._reader = lambda *a, **k: _R()
+    mod.DoubanClient = lambda *a, **k: _C()
+    try:
+        result = plugin.rescan_archive()
+    finally:
+        plugin._reader, mod.DoubanClient = orig_reader, orig_client
+
+    assert plugin.get_data("archive")["某剧_S1"]["episode"] == 18
+    return "未改动"
+
+
 def main():
     DoubanArchive = load_plugin_base()
     print("=" * 62)
