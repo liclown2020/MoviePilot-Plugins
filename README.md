@@ -4,7 +4,7 @@
 
 | 插件 | 类名 / 目录 | 版本 | 作者 | 来源 |
 | --- | --- | --- | --- | --- |
-| 豆瓣档案同步 | `DoubanArchive` / `plugins.v3/doubanarchive` | 1.7.3 | liclown2020 | 本仓库原创 |
+| 豆瓣档案同步 | `DoubanArchive` / `plugins.v3/doubanarchive` | 1.7.4 | liclown2020 | 本仓库原创 |
 | 缺失集数订阅V3版 | `EpisodeNoExistV3` / `plugins.v3/episodenoexistv3` | 1.0.2 | boeto / liclown2020 | 改编自 [boeto/MoviePilot-Plugins](https://github.com/boeto/MoviePilot-Plugins) 的「缺失集数订阅」0.0.8 |
 
 ---
@@ -103,6 +103,8 @@ cookie 里的 `login_flag`、`db_sid` 只影响**搜索**：缺它们搜不到�
 
 - 已看完的条目升级为「看过」；
 - **连载剧中被误标的「看过」会校正回「在看」**；
+- **集号按实际播放记录校准**——档案里的集号是「已看完的最大集号」，
+  不是最后触发事件的集号（Emby 集数增减或跳集时两者差异明显）；
 - 电影不参与（没有集号概念）；
 - 媒体服务器查不到的条目原样保留，不猜测。
 
