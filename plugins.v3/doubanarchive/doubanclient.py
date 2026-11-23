@@ -188,21 +188,46 @@ class DoubanClient:
 
     # ---------------- 内部实现 ----------------
 
-    def _download_image(self, url: str) -> Optional[str]:
-        """下载单张图片并转成 data URI，失败返回 None。"""
+    def fetch_image_bytes(self, url: str) -> Optional[Tuple[bytes, str]]:
+        """
+        取回图片的原始字节与 Content-Type，供图片代理端点使用。
+
+        豆瓣图片有防盗链：浏览器直连会返回 418 或 403，必须带上豆瓣自己的
+        Referer 才拿得到真图。媒体服务器自己的图（如 Emby 的 Items/.../Images）
+        则按普通图片直接取。
+        """
+        if not url:
+            return None
         headers = self._build_base_headers()
-        headers["Referer"] = "https://movie.douban.com/"
+        headers["Accept"] = "image/avif,image/webp,image/apng,image/*,*/*;q=0.8"
+        if "doubanio.com" in url:
+            headers["Referer"] = "https://movie.douban.com/"
         try:
             response = RequestUtils(headers=headers, timeout=self._timeout).get_res(url)
         except Exception as error:
-            logger.debug(f"下载豆瓣图片异常：{error}")
+            logger.debug(f"取回图片失败 {url}：{error}")
             return None
         if response is None or response.status_code != 200:
+            logger.debug(f"取回图片失败 {url}：状态码 {getattr(response, 'status_code', None)}")
             return None
         content = getattr(response, "content", None)
-        if not content or len(content) > 2 * 1024 * 1024:
+        if not content or len(content) > 4 * 1024 * 1024:
+            return None
+        # 防盗链失败时豆瓣会返回 200 但内容是十几字节的占位图，这里识别掉
+        if len(content) < 512 and "doubanio.com" in url:
+            logger.debug(f"豆瓣图片疑似占位图（{len(content)} 字节），丢弃")
             return None
         content_type = (response.headers.get("Content-Type") or "image/jpeg").split(";")[0].strip()
+        if not content_type.startswith("image/"):
+            content_type = "image/jpeg"
+        return content, content_type
+
+    def _download_image(self, url: str) -> Optional[str]:
+        """下载单张图片并转成 data URI，失败返回 None。"""
+        result = self.fetch_image_bytes(url)
+        if not result:
+            return None
+        content, content_type = result
         return f"data:{content_type};base64," + base64.b64encode(content).decode("ascii")
 
     def _post_interest(self, subject_id: str, payload: Dict[str, Any], retry: bool = False) -> bool:
