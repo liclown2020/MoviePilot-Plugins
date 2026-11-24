@@ -1555,21 +1555,24 @@ def test_image_proxy_reject_non_http(DoubanArchive):
 
 
 
-@case("仪表盘：所有月份都渲染，不按月份数截断")
-def test_dashboard_all_months(DoubanArchive):
+
+
+@case("仪表盘：默认只显示最近 N 个月，其余通过展开按钮查看")
+def test_dashboard_recent_plus_expand(DoubanArchive):
     plugin = DoubanArchive()
     plugin._enabled = True
     plugin._cookie = "ck=x"
     plugin._lock = __import__("threading").Lock()
+    plugin._pc_month = 2
+    plugin._mobile_month = 2
     plugin._pc_num = 50
     plugin._mobile_num = 15
     plugin._inline_image = False
 
     archive = {}
-    # 造 5 个月的数据，每月 3 条
     for m in range(1, 6):
-        for i in range(3):
-            archive[f"剧{m}_S1"] = {
+        for i in range(2):
+            archive[f"剧{m}_S1_{i}"] = {
                 "title": f"剧{m}", "subject_name": f"剧{m}",
                 "subject_id": str(m * 10 + i), "season": 1, "episode": i + 1,
                 "type": "电视剧", "status": "collect",
@@ -1579,13 +1582,86 @@ def test_dashboard_all_months(DoubanArchive):
     plugin.save_data("archive", archive)
 
     cols, attrs, elements = plugin.get_dashboard("archive")
-    carousel = elements[-1]
-    assert carousel["component"] == "VCarousel", carousel["component"]
-    pages = carousel["content"]
-    assert len(pages) == 5, f"应有 5 个月份，实际 {len(pages)}"
-    for page in pages:
-        assert page["component"] == "VCarouselItem", page["component"]
-    return "5 个月份全部渲染"
+    # 前 2 个是最近两个月的面板
+    timeline_panels = [e for e in elements if e.get("component") == "VTimeline"]
+    assert len(timeline_panels) == 2, f"默认应显示 2 个月，实际 {len(timeline_panels)}"
+    # 最后是展开按钮
+    toggle = elements[-1]
+    assert toggle.get("html"), "展开按钮应是 v-html"
+    assert "dba-expand-btn" in toggle["html"], "缺少展开按钮"
+    assert "展开全部（3 个月）" in toggle["html"], toggle["html"][:200]
+    return "默认 2 个月 + 展开 3 个月"
+
+
+@case("仪表盘：展开区有滚动条且包含全部剩余月份")
+def test_dashboard_expand_area_scroll(DoubanArchive):
+    plugin = DoubanArchive()
+    plugin._enabled = True
+    plugin._cookie = "ck=x"
+    plugin._lock = __import__("threading").Lock()
+    plugin._pc_month = 1
+    plugin._mobile_month = 1
+    plugin._pc_num = 50
+    plugin._mobile_num = 15
+    plugin._inline_image = False
+
+    archive = {}
+    for m in range(1, 5):
+        for i in range(2):
+            archive[f"剧{m}_S1_{i}"] = {
+                "title": f"剧{m}", "subject_name": f"剧{m}",
+                "subject_id": str(m * 10 + i), "season": 1, "episode": i + 1,
+                "type": "电视剧", "status": "collect",
+                "image": f"https://img3.doubanio.com/{m}_{i}.webp",
+                "timestamp": f"2026-0{m}-1{i} 12:00:00",
+            }
+    plugin.save_data("archive", archive)
+
+    cols, attrs, elements = plugin.get_dashboard("archive")
+    toggle = elements[-1]["html"]
+    # 右侧滚动条
+    assert "overflow-y:auto" in toggle, "展开区应可垂直滚动"
+    assert "max-height:70vh" in toggle, "展开区应限制高度"
+    # 展开区里应包含剩余 3 个月共 6 个卡片
+    # 默认展示最近 1 个月（4月），展开区是更早的 3 个月
+    assert "2026年1月" in toggle and "2026年2月" in toggle and "2026年3月" in toggle, "月份不全"
+    assert "2026年4月" not in toggle, "4月是默认展示的月份，不该出现在展开区"
+    assert toggle.count("<img") == 6, f"应有 6 张图，实际 {toggle.count('<img')}"
+    # 按钮的 onclick 要存在
+    assert "onclick" in toggle, "缺少 onclick"
+    return "展开区含 3 个月 6 张图，带滚动条"
+
+
+@case("仪表盘：展开区 HTML 对标题做转义")
+def test_dashboard_html_escape(DoubanArchive):
+    plugin = DoubanArchive()
+    plugin._enabled = True
+    plugin._cookie = "ck=x"
+    plugin._lock = __import__("threading").Lock()
+    plugin._pc_month = 1
+    plugin._mobile_month = 1
+    plugin._pc_num = 50
+    plugin._mobile_num = 15
+    plugin._inline_image = False
+
+    plugin.save_data("archive", {
+        "a_S1": {"title": "a", "subject_name": "a", "subject_id": "1",
+                 "season": 1, "episode": 1, "type": "电视剧", "status": "collect",
+                 "image": "https://img3.doubanio.com/1.webp",
+                 "timestamp": "2026-03-01 12:00:00"},
+        "b_S1": {"title": "it's <b>bold</b> & 'quoted'", "subject_name": "x",
+                 "subject_id": "2", "season": 1, "episode": 1,
+                 "type": "电视剧", "status": "collect",
+                 "image": "https://img3.doubanio.com/2.webp",
+                 "timestamp": "2026-02-01 12:00:00"},
+    })
+
+    cols, attrs, elements = plugin.get_dashboard("archive")
+    toggle = elements[-1]["html"]
+    # 裸的 <b> 不应出现（title 属性里的尖括号必须转义）
+    assert "title='it\'s" not in toggle.replace("&apos;", "'"), "引号未转义"
+    assert "&lt;b&gt;" in toggle or "&amp;" in toggle, "尖括号未转义"
+    return "标题已转义"
 
 
 @case("仪表盘：单月条目超限时分段显示而非丢弃")
@@ -1594,6 +1670,8 @@ def test_dashboard_no_item_loss(DoubanArchive):
     plugin._enabled = True
     plugin._cookie = "ck=x"
     plugin._lock = __import__("threading").Lock()
+    plugin._pc_month = 3
+    plugin._mobile_month = 2
     plugin._pc_num = 4
     plugin._mobile_num = 15
     plugin._inline_image = False
@@ -1610,37 +1688,13 @@ def test_dashboard_no_item_loss(DoubanArchive):
     plugin.save_data("archive", archive)
 
     cols, attrs, elements = plugin.get_dashboard("archive")
-    page = elements[-1]["content"][0]
-    timeline = page["content"][0]
-    rows = timeline["content"][0]["content"][1:]
-    # 10 条 / 每段 4 条 = 3 段，中间 2 个分隔线
+    panel = elements[0]
+    rows = panel["content"][0]["content"][1:]
     card_count = sum(len(r.get("content", [])) for r in rows if r["component"] == "VRow")
     dividers = sum(1 for r in rows if r["component"] == "VDivider")
     assert card_count == 10, f"卡片应全部渲染，实际 {card_count}"
     assert dividers == 2, f"应有 2 个分隔线，实际 {dividers}"
     return f"10 条分 3 段全渲染"
-
-
-@case("仪表盘：轮播高度设为 auto，避免默认 500px 截断")
-def test_dashboard_carousel_height(DoubanArchive):
-    plugin = DoubanArchive()
-    plugin._enabled = True
-    plugin._cookie = "ck=x"
-    plugin._lock = __import__("threading").Lock()
-    plugin._pc_num = 50
-    plugin._mobile_num = 15
-    plugin._inline_image = False
-    plugin.save_data("archive", {
-        "剧_S1": {"title": "剧", "subject_name": "剧", "subject_id": "1",
-                  "season": 1, "episode": 1, "type": "电视剧", "status": "collect",
-                  "image": "https://img3.doubanio.com/a.webp",
-                  "timestamp": "2026-03-01 12:00:00"},
-    })
-    cols, attrs, elements = plugin.get_dashboard("archive")
-    carousel = elements[-1]
-    assert carousel["props"]["height"] == "auto", carousel["props"]
-    assert carousel["props"].get("show-arrows") is True, carousel["props"]
-    return "height=auto 且开启箭头"
 
 
 def main():
