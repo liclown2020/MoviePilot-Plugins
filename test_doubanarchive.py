@@ -1697,6 +1697,67 @@ def test_dashboard_no_item_loss(DoubanArchive):
     return f"10 条分 3 段全渲染"
 
 
+
+@case("仪表盘：月份数不超过上限时展开按钮仍然出现")
+def test_dashboard_expand_always_available(DoubanArchive):
+    """回归：月份总数 <= 默认上限时，展开区曾为空导致按钮不生成。"""
+    plugin = DoubanArchive()
+    plugin._enabled = True
+    plugin._cookie = "ck=x"
+    plugin._lock = __import__("threading").Lock()
+    plugin._pc_month = 3
+    plugin._mobile_month = 3
+    plugin._pc_num = 50
+    plugin._mobile_num = 15
+    plugin._inline_image = False
+
+    # 只有 2 个月，但默认上限是 3 个月 —— 老BK 实际遇到的场景
+    archive = {}
+    for m, day in [(11, 1), (10, 1)]:
+        for i in range(2):
+            archive[f"剧{m}_{i}"] = {
+                "title": f"剧{m}", "subject_name": f"剧{m}",
+                "subject_id": str(m * 10 + i), "season": 1, "episode": i + 1,
+                "type": "电视剧", "status": "collect",
+                "image": f"https://img3.doubanio.com/{m}_{i}.webp",
+                "timestamp": f"2026-{m:02d}-1{i} 12:00:00",
+            }
+    plugin.save_data("archive", archive)
+
+    cols, attrs, elements = plugin.get_dashboard("archive")
+    toggles = [e for e in elements if e.get("html")]
+    assert toggles, "月份数不超过上限时，展开按钮也必须出现"
+    html = toggles[0]["html"]
+    assert "dba-expand-btn" in html, html[:200]
+    # 展开区应包含较早的那个月
+    assert "2026年10月" in html, "展开区应包含较早月份"
+    assert "2026年11月" not in html, "默认区月份不该重复出现在展开区"
+    return "2 个月场景下按钮正常出现"
+
+
+@case("仪表盘：只有 1 个月时不需要展开按钮")
+def test_dashboard_single_month_no_button(DoubanArchive):
+    plugin = DoubanArchive()
+    plugin._enabled = True
+    plugin._cookie = "ck=x"
+    plugin._lock = __import__("threading").Lock()
+    plugin._pc_month = 3
+    plugin._mobile_month = 3
+    plugin._pc_num = 50
+    plugin._mobile_num = 15
+    plugin._inline_image = False
+    plugin.save_data("archive", {
+        "剧_0": {"title": "剧", "subject_name": "剧", "subject_id": "1",
+                 "season": 1, "episode": 1, "type": "电视剧", "status": "collect",
+                 "image": "https://img3.doubanio.com/a.webp",
+                 "timestamp": "2026-11-01 12:00:00"},
+    })
+    cols, attrs, elements = plugin.get_dashboard("archive")
+    toggles = [e for e in elements if e.get("html")]
+    assert not toggles, "只有 1 个月时不该有展开按钮"
+    return "单月无按钮"
+
+
 def main():
     DoubanArchive = load_plugin_base()
     print("=" * 62)
