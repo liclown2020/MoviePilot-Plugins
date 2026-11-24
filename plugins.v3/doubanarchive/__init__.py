@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import base64
 import hashlib
-import html as html_lib
 import hmac
 import re
 import secrets
@@ -86,6 +85,8 @@ _IMAGE_URL_TTL = 7 * 24 * 3600
 _IMAGE_CACHE_MAX = 200
 # 单次渲染最多回源几张图，避免仪表盘请求太久
 _INLINE_BUDGET = 8
+# 仪表盘轮播区域高度，与宿主「近期整理」卡片一致
+_CAROUSEL_HEIGHT = 350
 
 
 class DoubanArchive(_PluginBase):
@@ -95,7 +96,7 @@ class DoubanArchive(_PluginBase):
     plugin_name = "豆瓣档案同步"
     plugin_desc = "将在看、看完状态同步到豆瓣书影音档案，不依赖 TMDB 识别，失败自动重试。"
     plugin_icon = "Douban_A.png"
-    plugin_version = "1.8.4"
+    plugin_version = "1.8.5"
     plugin_author = "liclown2020"
     author_url = "https://github.com/liclown2020"
     plugin_config_prefix = "doubanarchive_"
@@ -116,8 +117,6 @@ class DoubanArchive(_PluginBase):
     _pc_num = 50
     _mobile_num = 15
     # 默认展示几个月；「展开全部」后不受此限制
-    _pc_month = 3
-    _mobile_month = 2
     # 只同步这些媒体库，留空表示全部；多选组件存库名数组
     _libraries: Any = ()
     # 指定媒体服务器名称。宿主 webhook 不带服务器名，多实例时必须显式指定，
@@ -153,8 +152,6 @@ class DoubanArchive(_PluginBase):
         self._cc_password = str(config.get("cookiecloud_password") or "")
         self._pc_num = self._to_int(config.get("pc_num"), 50, 1)
         self._mobile_num = self._to_int(config.get("mobile_num"), 15, 1)
-        self._pc_month = self._to_int(config.get("pc_month"), 3, 1)
-        self._mobile_month = self._to_int(config.get("mobile_month"), 2, 1)
         self._libraries = config.get("libraries") or []
         self._server = str(config.get("server") or "").strip()
         self._inline_image = bool(config.get("inline_image", True))
@@ -1486,23 +1483,7 @@ class DoubanArchive(_PluginBase):
                                 "props": {"cols": 12, "md": 3},
                                 "content": [
                                     {"component": "VTextField",
-                                     "props": {"model": "pc_month", "label": "大屏默认显示月份数", "placeholder": "3"}}
-                                ],
-                            },
-                            {
-                                "component": "VCol",
-                                "props": {"cols": 12, "md": 3},
-                                "content": [
-                                    {"component": "VTextField",
                                      "props": {"model": "pc_num", "label": "大屏每段显示", "placeholder": "50"}}
-                                ],
-                            },
-                            {
-                                "component": "VCol",
-                                "props": {"cols": 12, "md": 3},
-                                "content": [
-                                    {"component": "VTextField",
-                                     "props": {"model": "mobile_month", "label": "小屏默认显示月份数", "placeholder": "2"}}
                                 ],
                             },
                             {
@@ -1577,8 +1558,6 @@ class DoubanArchive(_PluginBase):
             "rescan": False,
             "pc_num": 50,
             "mobile_num": 15,
-            "pc_month": 3,
-            "mobile_month": 2,
             "libraries": [],
             "server": "",
             "inline_image": True,
@@ -1674,7 +1653,6 @@ class DoubanArchive(_PluginBase):
             return None
         mobile = self._is_mobile(kwargs.get("user_agent"))
         archive = self.get_data(_KEY_ARCHIVE) or {}
-        limit_month = max(1, self._mobile_month if mobile else self._pc_month)
         limit_num = max(1, self._mobile_num if mobile else self._pc_num)
 
         # 显式给出标题，避免宿主用插件名兜底导致标题不一致
@@ -1753,78 +1731,67 @@ class DoubanArchive(_PluginBase):
                     ],
                 }
 
-            # 默认只展示最近若干个月，其余的通过「展开全部」查看。
-            # 默认区必须给展开区留出至少 1 个月，否则月份总数不超过上限时
-            # 展开区为空、按钮不会出现，用户点了没反应。
-            recent_count = min(limit_month, max(1, len(month_keys) - 1))
-            recent_panels = []
-            for year, month in month_keys[:recent_count]:
+            # 全部月份都渲染成轮播页，不再按 limit_month 截断——
+            # 截断会让早于最近几个月的记录完全看不到。
+            carousel_items: List[Dict[str, Any]] = []
+            for year, month in month_keys:
                 panel = build_month_panel(year, month, groups[(year, month)])
-                if panel:
-                    recent_panels.append(panel)
+                if not panel:
+                    continue
+                # 页内内容包一层滚动容器：高度封顶、滚动条隐藏，
+                # 鼠标悬停时用滚轮浏览，效果与宿主「近期整理」组件一致。
+                # 必须用 max-height 而非 height:100%——Vuetify 的 .v-window-item
+                # 没有高度规则（只有 padding），父级是 auto 高度，
+                # 此时 height:100% 无参照物，内容会溢出并被 .v-window 的
+                # overflow:hidden 裁掉，反而滚不了（已实测）。
+                carousel_items.append({
+                    "component": "VCarouselItem",
+                    "props": {"value": f"{year}-{month:02d}"},
+                    "content": [
+                        {
+                            "component": "div",
+                            "props": {
+                                "class": "dba-poster-scroll",
+                                "style": f"max-height:{_CAROUSEL_HEIGHT - 10}px;"
+                                         "overflow-y:auto;overflow-x:hidden;"
+                                         "overscroll-behavior:contain;scrollbar-width:none;",
+                            },
+                            "content": [panel],
+                        }
+                    ],
+                })
 
-            if not recent_panels:
+            if not carousel_items:
                 return {"cols": 12, "md": 6}, attrs, empty
 
-            elements: List[Dict[str, Any]] = list(recent_panels)
+            elements: List[Dict[str, Any]] = []
 
-            # 「展开全部」用 v-html + 内联 onclick 实现。
-            # 宿主 JSON 渲染器不处理 events 字段（props 只做 v-bind 透传，
-            # JSON 里的函数也传不过去），但 v-html 插入的 DOM 上写 onclick
-            # 属性是有效的浏览器行为，不依赖任何外部脚本或绑定。
-            hidden_months = month_keys[recent_count:]
-            if hidden_months:
-                # 展开区里要显示的月份面板，全部预先构建好放进隐藏容器
-                all_panels = []
-                for year, month in hidden_months:
-                    panel = build_month_panel(year, month, groups[(year, month)])
-                    if panel:
-                        all_panels.append(panel)
+            # 滚动条隐藏（Firefox 用 scrollbar-width，Chrome/Edge 用伪元素），
+            # 与宿主「近期整理」组件的做法一致：看不到滚动条，但滚轮可滚动。
+            elements.append({
+                "component": "div",
+                "html": (
+                    "<style>"
+                    ".dba-poster-scroll::-webkit-scrollbar{display:none;width:0;height:0}"
+                    ".dba-poster-scroll{-ms-overflow-style:none;scrollbar-width:none;"
+                    "-webkit-overflow-scrolling:touch}"
+                    "</style>"
+                ),
+            })
 
-                # 把面板渲染成 HTML 字符串（Vuetify 组件树无法直接塞进 v-html，
-                # 因此这里手写等价的卡片 HTML，保证展开后样式与默认区一致）
-                hidden_html = self._panels_to_html(all_panels, mobile)
-
-                # onclick 写在 HTML 属性里，&& 需写成实体，否则会被当作属性结束符
-                toggle_script = (
-                    "var b=document.getElementById('dba-expand-btn');"
-                    "var t=document.getElementById('dba-expand-area');"
-                    "var s=document.getElementById('dba-expand-short');"
-                    "if(b&amp;&amp;t){"
-                    "  var open=t.style.display!=='none';"
-                    "  t.style.display=open?'none':'block';"
-                    "  if(s) s.style.display=open?'block':'none';"
-                    "  b.textContent=open?'展开全部（'+t.dataset.count+' 个月）':'收起';"
-                    "}"
-                )
-                elements.append({
-                    "component": "div",
-                    "html": (
-                        f"<div id='dba-expand-btn' role='button' tabindex='0'"
-                        f" style='display:inline-block;margin:0.5rem 0;padding:0.25rem 0.75rem;"
-                        f"border:1px solid rgba(128,128,128,0.4);border-radius:4px;"
-                        f"cursor:pointer;font-size:0.875rem;user-select:none;'"
-                        f" onclick=\"{toggle_script}\">展开全部（{len(hidden_months)} 个月）</div>"
-                        f"<div id='dba-expand-short' style='display:none;"
-                        f"font-size:0.75rem;opacity:0.7;'>已展开全部月份</div>"
-                        f"<div id='dba-expand-area' data-count='{len(hidden_months)}'"
-                        f" style='display:none;height:300px;overflow-y:scroll;"
-                        f"overflow-x:hidden;padding-right:0.5rem;'>{hidden_html}</div>"
-                        # v-html 插入的 <style> 是生效的（CSS 全局生效，
-                        # 与 <script> 不同），用它把滚动条做明显一些
-                        "<style>"
-                        "#dba-expand-area::-webkit-scrollbar{width:10px}"
-                        "#dba-expand-area::-webkit-scrollbar-track{"
-                        "background:rgba(128,128,128,0.16);border-radius:5px}"
-                        "#dba-expand-area::-webkit-scrollbar-thumb{"
-                        "background:rgba(128,128,128,0.55);border-radius:5px}"
-                        "#dba-expand-area::-webkit-scrollbar-thumb:hover{"
-                        "background:rgba(128,128,128,0.8)}"
-                        "#dba-expand-area{scrollbar-width:thin;"
-                        "scrollbar-color:rgba(128,128,128,0.55) rgba(128,128,128,0.16)}"
-                        "</style>"
-                    ),
-                })
+            elements.append({
+                # VCarousel 的左右箭头是组件内部交互，不依赖外部绑定，
+                # 因此在 JSON 渲染模式下也能正常翻页。
+                # 高度固定为 350px，与宿主「近期整理」卡片一致。
+                "component": "VCarousel",
+                "props": {
+                    "height": f"{_CAROUSEL_HEIGHT}px",
+                    "show-arrows": True,
+                    "hide-delimiters": True,
+                    "hide-delimiter-background": True,
+                },
+                "content": carousel_items,
+            })
 
             return (
                 {"cols": 12, "md": 8},
@@ -1833,82 +1800,6 @@ class DoubanArchive(_PluginBase):
             )
         finally:
             self._flush_images()
-
-    def _panels_to_html(self, panels: List[Dict[str, Any]], mobile: bool) -> str:
-        """
-        把月份面板转成等价的 HTML 片段。
-
-        v-html 里无法嵌套 Vuetify 组件树，因此展开区用手写 HTML 还原
-        海报卡片：外链、封面、标题提示。样式与默认区保持一致。
-        """
-        width, height = ("44px", "66px") if mobile else ("66px", "99px")
-        chunks: List[str] = []
-
-        def find_image(node: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-            """在卡片组件树里找到承载封面的 VImg 或文字占位。"""
-            if node.get("component") == "VImg":
-                return node
-            for child in node.get("content", []) or []:
-                if isinstance(child, dict):
-                    found = find_image(child)
-                    if found:
-                        return found
-            return None
-
-        def find_text_placeholder(node: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-            """找缺封面时用的文字占位（VCardText）。"""
-            if node.get("component") == "VCardText":
-                return node
-            for child in node.get("content", []) or []:
-                if isinstance(child, dict):
-                    found = find_text_placeholder(child)
-                    if found:
-                        return found
-            return None
-
-        for panel in panels:
-            for timeline_item in panel.get("content", []) or []:
-                for block in timeline_item.get("content", []) or []:
-                    if block.get("component") == "h1":
-                        chunks.append(
-                            "<div style='padding:0.5rem 0;font-weight:bold;font-size:1rem;'>"
-                            f"{block.get('html', '')}</div>")
-                        continue
-                    if block.get("component") != "VRow":
-                        continue
-                    cells = []
-                    for card in block.get("content", []) or []:
-                        props = card.get("props", {})
-                        href = html_lib.escape(str(props.get("href", "")), quote=True)
-                        title = html_lib.escape(str(props.get("title", "")), quote=True)
-                        image = ""
-                        body = card.get("content", []) or []
-                        img_node = find_image(card)
-                        if img_node:
-                            src = html_lib.escape(
-                                str(img_node.get("props", {}).get("src", "")), quote=True)
-                            image = (
-                                f"<img src='{src}'"
-                                f" style='width:{width};height:{height};object-fit:cover;"
-                                f"border-radius:4px;display:block;' />")
-                        else:
-                            text_node = find_text_placeholder(card)
-                            text = html_lib.escape(
-                                str((text_node or {}).get("props", {}).get("text", ""))[:4])
-                            image = (
-                                f"<div style='width:{width};height:{height};display:flex;"
-                                f"align-items:center;justify-content:center;font-size:0.75rem;"
-                                f"opacity:0.7;border:1px solid rgba(128,128,128,0.3);"
-                                f"border-radius:4px;'>{text}</div>")
-                        cells.append(
-                            f"<a href='{href}' target='_blank' title='{title}'"
-                            f" style='padding:0.2rem;text-decoration:none;display:inline-block;'>{image}</a>")
-                    chunks.append(
-                        "<div style='display:flex;flex-wrap:wrap;padding:0;'>"
-                        + "".join(cells) + "</div>")
-        return "".join(chunks)
-
-    # ---------------- 仪表盘辅助 ----------------
 
     @staticmethod
     def _parse_time(value: Any) -> Optional[datetime]:
