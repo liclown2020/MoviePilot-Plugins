@@ -4,7 +4,7 @@
 
 | 插件 | 类名 / 目录 | 版本 | 作者 | 来源 |
 | --- | --- | --- | --- | --- |
-| 豆瓣档案同步 | `DoubanArchive` / `plugins.v3/doubanarchive` | 1.8.3 | liclown2020 | 本仓库原创 |
+| 豆瓣档案同步 | `DoubanArchive` / `plugins.v3/doubanarchive` | 1.8.4 | liclown2020 | 本仓库原创 |
 | 缺失集数订阅V3版 | `EpisodeNoExistV3` / `plugins.v3/episodenoexistv3` | 1.0.2 | boeto / liclown2020 | 改编自 [boeto/MoviePilot-Plugins](https://github.com/boeto/MoviePilot-Plugins) 的「缺失集数订阅」0.0.8 |
 
 ---
@@ -120,7 +120,7 @@ cookie 里的 `login_flag`、`db_sid` 只影响**搜索**：缺它们搜不到�
 默认显示最近若干个月（配置项「默认显示月份数」，大屏默认 3 个月），
 下方有一个**「展开全部」按钮**，点击后展开剩余的全部月份，再点一次收起。
 
-展开区高度受限并带**右侧滚动条**，可以慢慢翻看全部历史记录。
+展开区固定高度并带**右侧滚动条**，可以慢慢翻看全部历史记录。
 单月条目较多时会分段展示并加分隔线，不会静默丢弃条目。
 
 早期版本按「显示月份数」硬截断，更早的记录完全无法查看——现已改为可展开查看。
