@@ -94,7 +94,7 @@ class DoubanArchive(_PluginBase):
     plugin_name = "豆瓣档案同步"
     plugin_desc = "将在看、看完状态同步到豆瓣书影音档案，不依赖 TMDB 识别，失败自动重试。"
     plugin_icon = "Douban_A.png"
-    plugin_version = "1.8.0"
+    plugin_version = "1.8.1"
     plugin_author = "liclown2020"
     author_url = "https://github.com/liclown2020"
     plugin_config_prefix = "doubanarchive_"
@@ -112,9 +112,7 @@ class DoubanArchive(_PluginBase):
     _cc_host = ""
     _cc_key = ""
     _cc_password = ""
-    _pc_month = 3
     _pc_num = 50
-    _mobile_month = 2
     _mobile_num = 15
     # 只同步这些媒体库，留空表示全部；多选组件存库名数组
     _libraries: Any = ()
@@ -149,9 +147,7 @@ class DoubanArchive(_PluginBase):
         self._cc_host = str(config.get("cookiecloud_host") or "")
         self._cc_key = str(config.get("cookiecloud_key") or "")
         self._cc_password = str(config.get("cookiecloud_password") or "")
-        self._pc_month = self._to_int(config.get("pc_month"), 3, 2)
         self._pc_num = self._to_int(config.get("pc_num"), 50, 1)
-        self._mobile_month = self._to_int(config.get("mobile_month"), 2, 2)
         self._mobile_num = self._to_int(config.get("mobile_num"), 15, 1)
         self._libraries = config.get("libraries") or []
         self._server = str(config.get("server") or "").strip()
@@ -1484,7 +1480,7 @@ class DoubanArchive(_PluginBase):
                                 "props": {"cols": 12, "md": 3},
                                 "content": [
                                     {"component": "VTextField",
-                                     "props": {"model": "pc_month", "label": "大屏显示月份数", "placeholder": "3"}}
+                                     "props": {"model": "pc_num", "label": "大屏每段显示", "placeholder": "50"}}
                                 ],
                             },
                             {
@@ -1492,23 +1488,7 @@ class DoubanArchive(_PluginBase):
                                 "props": {"cols": 12, "md": 3},
                                 "content": [
                                     {"component": "VTextField",
-                                     "props": {"model": "pc_num", "label": "大屏每月最多显示", "placeholder": "50"}}
-                                ],
-                            },
-                            {
-                                "component": "VCol",
-                                "props": {"cols": 12, "md": 3},
-                                "content": [
-                                    {"component": "VTextField",
-                                     "props": {"model": "mobile_month", "label": "小屏显示月份数", "placeholder": "2"}}
-                                ],
-                            },
-                            {
-                                "component": "VCol",
-                                "props": {"cols": 12, "md": 3},
-                                "content": [
-                                    {"component": "VTextField",
-                                     "props": {"model": "mobile_num", "label": "小屏每月最多显示", "placeholder": "15"}}
+                                     "props": {"model": "mobile_num", "label": "小屏每段显示", "placeholder": "15"}}
                                 ],
                             },
                         ],
@@ -1573,9 +1553,7 @@ class DoubanArchive(_PluginBase):
             "cookiecloud_password": "",
             "onlyonce": False,
             "rescan": False,
-            "pc_month": 3,
             "pc_num": 50,
-            "mobile_month": 2,
             "mobile_num": 15,
             "libraries": [],
             "server": "",
@@ -1667,12 +1645,11 @@ class DoubanArchive(_PluginBase):
         return [{"key": _KEY_DASHBOARD, "name": "豆瓣档案"}]
 
     def get_dashboard(self, key: str, **kwargs: Any) -> Optional[Tuple[Dict[str, Any], Dict[str, Any], List[Dict[str, Any]]]]:
-        """返回仪表盘：按月分组的豆瓣档案海报墙。"""
+        """返回仪表盘：按月分组的豆瓣档案海报墙，支持左右翻页查看全部月份。"""
         if key and key != _KEY_DASHBOARD:
             return None
         mobile = self._is_mobile(kwargs.get("user_agent"))
         archive = self.get_data(_KEY_ARCHIVE) or {}
-        limit_month = max(1, self._mobile_month if mobile else self._pc_month)
         limit_num = max(1, self._mobile_num if mobile else self._pc_num)
 
         # 显式给出标题，避免宿主用插件名兜底导致标题不一致
@@ -1706,43 +1683,89 @@ class DoubanArchive(_PluginBase):
 
         self._prepare_images()
         try:
-            timeline_items: List[Dict[str, Any]] = []
-            for year, month in sorted(groups.keys(), reverse=True)[:limit_month]:
+            month_keys = sorted(groups.keys(), reverse=True)
+            # 轮播页：每个月一页，左右箭头翻页。全部月份都渲染出来，
+            # 不再按 limit_month 截断——截断会导致早于最近几个月的记录看不到。
+            carousel_items: List[Dict[str, Any]] = []
+            month_labels: List[str] = []
+            for year, month in month_keys:
                 cards = [card for card in (self._build_card(item, mobile) for item in groups[(year, month)]) if card]
                 if not cards:
                     continue
-                timeline_items.append({
-                    "component": "VTimelineItem",
-                    "props": {"size": "x-small", "dot-color": "primary"},
+                month_labels.append(f"{year}年{month}月")
+                total = len(cards)
+                # 单月条目过多时按 limit_num 分段，分段间用 VDivider 隔开，
+                # 保证当月所有条目都能看到（不再静默截断）。
+                rows: List[Dict[str, Any]] = []
+                for start in range(0, total, limit_num):
+                    if start:
+                        rows.append({
+                            "component": "VDivider",
+                            "props": {"class": "my-1"},
+                        })
+                    rows.append({
+                        "component": "VRow",
+                        "props": {"class": "pa-0 ma-0", "style": "padding:0rem;"},
+                        "content": cards[start:start + limit_num],
+                    })
+
+                carousel_items.append({
+                    "component": "VCarouselItem",
+                    "props": {"value": f"{year}-{month:02d}"},
                     "content": [
                         {
-                            "component": "h1",
-                            "props": {"class": "text-base",
-                                      "style": "padding:0rem 0rem 0.5rem 0rem;font-weight:bold;"},
-                            "html": f"{year}年{month}月 <span class='text-sm font-normal'>共 {len(cards)} 部</span>",
-                        },
-                        {
-                            "component": "VRow",
-                            "props": {"class": "pa-0 ma-0", "style": "padding:0rem;"},
-                            "content": cards[:limit_num],
-                        },
+                            "component": "VTimeline",
+                            "props": {"density": "compact"},
+                            "content": [
+                                {
+                                    "component": "VTimelineItem",
+                                    "props": {"size": "x-small", "dot-color": "primary"},
+                                    "content": [
+                                        {
+                                            "component": "h1",
+                                            "props": {"class": "text-base",
+                                                      "style": "padding:0rem 0rem 0.5rem 0rem;font-weight:bold;"},
+                                            "html": f"{year}年{month}月 <span class='text-sm font-normal'>共 {total} 部</span>",
+                                        },
+                                        *rows,
+                                    ],
+                                }
+                            ],
+                        }
                     ],
                 })
 
-            if not timeline_items:
+            if not carousel_items:
                 return {"cols": 12, "md": 6}, attrs, empty
+
+            elements: List[Dict[str, Any]] = []
+            if len(carousel_items) > 1:
+                # 多个月份时给出月份标签，方便知道当前在看哪个月
+                elements.append({
+                    "component": "div",
+                    "props": {"class": "text-caption text-medium-emphasis mb-1",
+                              "text": f"共 {len(carousel_items)} 个月份，用左右箭头翻页"},
+                })
+
+            elements.append({
+                # VCarousel 的左右箭头是组件内部交互，不依赖外部绑定，
+                # 因此在 JSON 渲染模式下也能正常翻页。
+                # height 必须显式设为 auto，否则默认固定 500px 会截断内容。
+                "component": "VCarousel",
+                "props": {
+                    "height": "auto",
+                    "show-arrows": True,
+                    "hide-delimiters": True,
+                    "hide-delimiter-background": True,
+                    "style": "height:auto;",
+                },
+                "content": carousel_items,
+            })
 
             return (
                 {"cols": 12, "md": 8},
                 attrs,
-                [
-                    {
-                        # VTimelineItem 必须放在 VTimeline 里，否则时间线渲染不出来
-                        "component": "VTimeline",
-                        "props": {"density": "compact"},
-                        "content": timeline_items,
-                    }
-                ],
+                elements,
             )
         finally:
             self._flush_images()
