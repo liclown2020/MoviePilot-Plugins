@@ -95,7 +95,7 @@ class DoubanArchive(_PluginBase):
     plugin_name = "豆瓣档案同步"
     plugin_desc = "将在看、看完状态同步到豆瓣书影音档案，不依赖 TMDB 识别，失败自动重试。"
     plugin_icon = "Douban_A.png"
-    plugin_version = "1.8.2"
+    plugin_version = "1.8.3"
     plugin_author = "liclown2020"
     author_url = "https://github.com/liclown2020"
     plugin_config_prefix = "doubanarchive_"
@@ -1753,9 +1753,12 @@ class DoubanArchive(_PluginBase):
                     ],
                 }
 
-            # 默认只展示最近 limit_month 个月，其余的通过「展开全部」查看
+            # 默认只展示最近若干个月，其余的通过「展开全部」查看。
+            # 默认区必须给展开区留出至少 1 个月，否则月份总数不超过上限时
+            # 展开区为空、按钮不会出现，用户点了没反应。
+            recent_count = min(limit_month, max(1, len(month_keys) - 1))
             recent_panels = []
-            for year, month in month_keys[:limit_month]:
+            for year, month in month_keys[:recent_count]:
                 panel = build_month_panel(year, month, groups[(year, month)])
                 if panel:
                     recent_panels.append(panel)
@@ -1769,7 +1772,7 @@ class DoubanArchive(_PluginBase):
             # 宿主 JSON 渲染器不处理 events 字段（props 只做 v-bind 透传，
             # JSON 里的函数也传不过去），但 v-html 插入的 DOM 上写 onclick
             # 属性是有效的浏览器行为，不依赖任何外部脚本或绑定。
-            hidden_months = month_keys[limit_month:]
+            hidden_months = month_keys[recent_count:]
             if hidden_months:
                 # 展开区里要显示的月份面板，全部预先构建好放进隐藏容器
                 all_panels = []
