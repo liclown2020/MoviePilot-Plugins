@@ -95,7 +95,7 @@ class DoubanArchive(_PluginBase):
     plugin_name = "豆瓣档案同步"
     plugin_desc = "将在看、看完状态同步到豆瓣书影音档案，不依赖 TMDB 识别，失败自动重试。"
     plugin_icon = "Douban_A.png"
-    plugin_version = "1.8.3"
+    plugin_version = "1.8.4"
     plugin_author = "liclown2020"
     author_url = "https://github.com/liclown2020"
     plugin_config_prefix = "doubanarchive_"
@@ -1808,8 +1808,21 @@ class DoubanArchive(_PluginBase):
                         f"<div id='dba-expand-short' style='display:none;"
                         f"font-size:0.75rem;opacity:0.7;'>已展开全部月份</div>"
                         f"<div id='dba-expand-area' data-count='{len(hidden_months)}'"
-                        f" style='display:none;max-height:70vh;overflow-y:auto;overflow-x:hidden;"
-                        f"padding-right:0.5rem;'>{hidden_html}</div>"
+                        f" style='display:none;height:300px;overflow-y:scroll;"
+                        f"overflow-x:hidden;padding-right:0.5rem;'>{hidden_html}</div>"
+                        # v-html 插入的 <style> 是生效的（CSS 全局生效，
+                        # 与 <script> 不同），用它把滚动条做明显一些
+                        "<style>"
+                        "#dba-expand-area::-webkit-scrollbar{width:10px}"
+                        "#dba-expand-area::-webkit-scrollbar-track{"
+                        "background:rgba(128,128,128,0.16);border-radius:5px}"
+                        "#dba-expand-area::-webkit-scrollbar-thumb{"
+                        "background:rgba(128,128,128,0.55);border-radius:5px}"
+                        "#dba-expand-area::-webkit-scrollbar-thumb:hover{"
+                        "background:rgba(128,128,128,0.8)}"
+                        "#dba-expand-area{scrollbar-width:thin;"
+                        "scrollbar-color:rgba(128,128,128,0.55) rgba(128,128,128,0.16)}"
+                        "</style>"
                     ),
                 })
 
