@@ -1619,9 +1619,11 @@ def test_dashboard_expand_area_scroll(DoubanArchive):
 
     cols, attrs, elements = plugin.get_dashboard("archive")
     toggle = elements[-1]["html"]
-    # 右侧滚动条
-    assert "overflow-y:auto" in toggle, "展开区应可垂直滚动"
-    assert "max-height:70vh" in toggle, "展开区应限制高度"
+    # 右侧滚动条：固定高度上限 + 强制显示滚动条轨道
+    assert "overflow-y:scroll" in toggle, "展开区应强制显示滚动条"
+    assert "height:300px" in toggle, "展开区应固定高度"
+    # 自定义滚动条样式（v-html 里的 <style> 生效）
+    assert "::-webkit-scrollbar" in toggle, "缺少滚动条样式"
     # 展开区里应包含剩余 3 个月共 6 个卡片
     # 默认展示最近 1 个月（4月），展开区是更早的 3 个月
     assert "2026年1月" in toggle and "2026年2月" in toggle and "2026年3月" in toggle, "月份不全"
