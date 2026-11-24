@@ -1554,6 +1554,95 @@ def test_image_proxy_reject_non_http(DoubanArchive):
     return "非法地址被拒"
 
 
+
+@case("仪表盘：所有月份都渲染，不按月份数截断")
+def test_dashboard_all_months(DoubanArchive):
+    plugin = DoubanArchive()
+    plugin._enabled = True
+    plugin._cookie = "ck=x"
+    plugin._lock = __import__("threading").Lock()
+    plugin._pc_num = 50
+    plugin._mobile_num = 15
+    plugin._inline_image = False
+
+    archive = {}
+    # 造 5 个月的数据，每月 3 条
+    for m in range(1, 6):
+        for i in range(3):
+            archive[f"剧{m}_S1"] = {
+                "title": f"剧{m}", "subject_name": f"剧{m}",
+                "subject_id": str(m * 10 + i), "season": 1, "episode": i + 1,
+                "type": "电视剧", "status": "collect",
+                "image": f"https://img3.doubanio.com/{m}_{i}.webp",
+                "timestamp": f"2026-0{m}-1{i} 12:00:00",
+            }
+    plugin.save_data("archive", archive)
+
+    cols, attrs, elements = plugin.get_dashboard("archive")
+    carousel = elements[-1]
+    assert carousel["component"] == "VCarousel", carousel["component"]
+    pages = carousel["content"]
+    assert len(pages) == 5, f"应有 5 个月份，实际 {len(pages)}"
+    for page in pages:
+        assert page["component"] == "VCarouselItem", page["component"]
+    return "5 个月份全部渲染"
+
+
+@case("仪表盘：单月条目超限时分段显示而非丢弃")
+def test_dashboard_no_item_loss(DoubanArchive):
+    plugin = DoubanArchive()
+    plugin._enabled = True
+    plugin._cookie = "ck=x"
+    plugin._lock = __import__("threading").Lock()
+    plugin._pc_num = 4
+    plugin._mobile_num = 15
+    plugin._inline_image = False
+
+    archive = {}
+    for i in range(10):
+        archive[f"剧_S1_{i}"] = {
+            "title": "剧", "subject_name": "剧",
+            "subject_id": str(100 + i), "season": 1, "episode": i + 1,
+            "type": "电视剧", "status": "collect",
+            "image": f"https://img3.doubanio.com/{i}.webp",
+            "timestamp": "2026-03-01 12:00:00",
+        }
+    plugin.save_data("archive", archive)
+
+    cols, attrs, elements = plugin.get_dashboard("archive")
+    page = elements[-1]["content"][0]
+    timeline = page["content"][0]
+    rows = timeline["content"][0]["content"][1:]
+    # 10 条 / 每段 4 条 = 3 段，中间 2 个分隔线
+    card_count = sum(len(r.get("content", [])) for r in rows if r["component"] == "VRow")
+    dividers = sum(1 for r in rows if r["component"] == "VDivider")
+    assert card_count == 10, f"卡片应全部渲染，实际 {card_count}"
+    assert dividers == 2, f"应有 2 个分隔线，实际 {dividers}"
+    return f"10 条分 3 段全渲染"
+
+
+@case("仪表盘：轮播高度设为 auto，避免默认 500px 截断")
+def test_dashboard_carousel_height(DoubanArchive):
+    plugin = DoubanArchive()
+    plugin._enabled = True
+    plugin._cookie = "ck=x"
+    plugin._lock = __import__("threading").Lock()
+    plugin._pc_num = 50
+    plugin._mobile_num = 15
+    plugin._inline_image = False
+    plugin.save_data("archive", {
+        "剧_S1": {"title": "剧", "subject_name": "剧", "subject_id": "1",
+                  "season": 1, "episode": 1, "type": "电视剧", "status": "collect",
+                  "image": "https://img3.doubanio.com/a.webp",
+                  "timestamp": "2026-03-01 12:00:00"},
+    })
+    cols, attrs, elements = plugin.get_dashboard("archive")
+    carousel = elements[-1]
+    assert carousel["props"]["height"] == "auto", carousel["props"]
+    assert carousel["props"].get("show-arrows") is True, carousel["props"]
+    return "height=auto 且开启箭头"
+
+
 def main():
     DoubanArchive = load_plugin_base()
     print("=" * 62)
